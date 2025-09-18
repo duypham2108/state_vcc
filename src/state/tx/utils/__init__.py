@@ -210,6 +210,7 @@ def get_lightning_module(model_type: str, data_config: dict, model_config: dict,
             output_dim=var_dims["output_dim"],
             pert_dim=var_dims["pert_dim"],
             batch_dim=var_dims["batch_dim"],
+            basal_mapping_strategy=data_config["basal_mapping_strategy"],
             **module_config,
         )
     elif model_type.lower() == "globalsimplesum" or model_type.lower() == "perturb_mean":

@@ -115,6 +115,7 @@ class StateTransitionPerturbationModel(PerturbationModel):
         output_dim: int,
         pert_dim: int,
         batch_dim: int = None,
+        basal_mapping_strategy: str = "random",
         predict_residual: bool = True,
         distributional_loss: str = "energy",
         transformer_backbone_key: str = "GPT2",
@@ -158,16 +159,20 @@ class StateTransitionPerturbationModel(PerturbationModel):
         self.detach_decoder = kwargs.get("detach_decoder", False)
 
         self.use_batch_token = kwargs.get("use_batch_token", False)
+        # Cleanly handle mutually exclusive use_batch_token conditions
+        disable_reasons = []
         if self.batch_encoder and self.use_batch_token:
-            self.use_batch_token = False
-            logger.warning("Batch token is not supported when batch encoder is used, setting use_batch_token to False")
-            try:
-                self.hparams["use_batch_token"] = False
-            except Exception:
-                pass
+            disable_reasons.append("batch encoder is used")
+        if basal_mapping_strategy == "random" and self.use_batch_token:
+            disable_reasons.append("basal mapping strategy is random")
         if kwargs.get("confidence_token", False) and self.use_batch_token:
+            disable_reasons.append("confidence token is used")
+
+        if disable_reasons:
             self.use_batch_token = False
-            logger.warning("Batch token is not supported when confidence token is used, setting use_batch_token to False")
+            logger.warning(
+                f"Batch token is not supported when {' or '.join(disable_reasons)}, setting use_batch_token to False"
+            )
             try:
                 self.hparams["use_batch_token"] = False
             except Exception:
