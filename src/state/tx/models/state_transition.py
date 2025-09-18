@@ -5,6 +5,7 @@ import anndata as ad
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from geomloss import SamplesLoss
 from typing import Tuple
@@ -155,6 +156,44 @@ class StateTransitionPerturbationModel(PerturbationModel):
         self.decoder_loss_weight = kwargs.get("decoder_weight", 1.0)
         self.regularization = kwargs.get("regularization", 0.0)
         self.detach_decoder = kwargs.get("detach_decoder", False)
+
+        self.use_batch_token = kwargs.get("use_batch_token", False)
+        if self.batch_encoder and self.use_batch_token:
+            self.use_batch_token = False
+            logger.warning("Batch token is not supported when batch encoder is used, setting use_batch_token to False")
+            try:
+                self.hparams["use_batch_token"] = False
+            except Exception:
+                pass
+        if kwargs.get("confidence_token", False) and self.use_batch_token:
+            self.use_batch_token = False
+            logger.warning("Batch token is not supported when confidence token is used, setting use_batch_token to False")
+            try:
+                self.hparams["use_batch_token"] = False
+            except Exception:
+                pass
+
+        self.batch_token_weight = kwargs.get("batch_token_weight", 0.1)
+        self.batch_token_num_classes: Optional[int] = batch_dim if self.use_batch_token else None
+
+        if self.use_batch_token:
+            if self.batch_token_num_classes is None:
+                raise ValueError("batch_token_num_classes must be set when use_batch_token is True")
+            self.batch_token = nn.Parameter(torch.randn(1, 1, self.hidden_dim))
+            self.batch_classifier = build_mlp(
+                in_dim=1,
+                out_dim=self.batch_token_num_classes,
+                hidden_dim=self.hidden_dim,
+                n_layers=1,
+                dropout=self.dropout,
+                activation=self.activation_class,
+            )
+        else:
+            self.batch_token = None
+            self.batch_classifier = None
+
+        # Internal cache for last token features (B, S, H) from transformer for aux loss
+        self._token_features: Optional[torch.Tensor] = None
 
         self.transformer_backbone_key = transformer_backbone_key
         self.transformer_backbone_kwargs = transformer_backbone_kwargs
@@ -373,9 +412,15 @@ class StateTransitionPerturbationModel(PerturbationModel):
             batch_embeddings = self.batch_encoder(batch_indices.long())  # Shape: [B, S, hidden_dim]
             seq_input = seq_input + batch_embeddings
 
+        if self.use_batch_token and self.batch_token is not None:
+            batch_size, _, _ = seq_input.shape
+            # Append the batch token to the sequence along the sequence dimension
+            # [B, S, H] -> [B, S+1, H]
+            seq_input = torch.cat([seq_input, self.batch_token.expand(batch_size, -1, -1)], dim=1)
+
         confidence_pred = None
         if self.confidence_token is not None:
-            # Append confidence token: [B, S, E] -> [B, S+1, E]
+            # Append confidence token: [B, S, E] -> [B, S+1, E] (might be one more if we have the batch token)
             seq_input = self.confidence_token.append_confidence_token(seq_input)
 
         # forward pass + extract CLS last hidden state
@@ -399,8 +444,13 @@ class StateTransitionPerturbationModel(PerturbationModel):
         # Extract confidence prediction if confidence token was used
         if self.confidence_token is not None:
             res_pred, confidence_pred = self.confidence_token.extract_confidence_prediction(transformer_output)
+        elif self.use_batch_token and self.batch_token is not None:
+            res_pred = transformer_output[:, :-1, :]  # [B, S, H]
+            batch_token_pred = transformer_output[:, -1:, :]  # [B, 1, H]
+            self._token_features = batch_token_pred
         else:
             res_pred = transformer_output
+            self._token_features = None
 
         # add to basal if predicting residual
         if self.predict_residual and self.output_space == "all":
@@ -459,6 +509,25 @@ class StateTransitionPerturbationModel(PerturbationModel):
         # Process decoder if available
         decoder_loss = None
         total_loss = main_loss
+
+        if self.use_batch_token and self.batch_classifier is not None and self._token_features is not None:
+            logits = self.batch_classifier(self._token_features)
+            batch_token_targets = batch["batch"]
+
+            C  = logits.size(-1)
+            # Normalize labels to integer indices [B, 1]
+            # Assume one batch token per row in the batch (not per cell)
+            # logits: [B, C], batch_token_targets: [B] or [B, C] (one-hot)
+            if batch_token_targets.dim() > 1 and batch_token_targets.size(-1) == C:
+                # one-hot to indices
+                target_idx = batch_token_targets.argmax(-1)
+            else:
+                # integer labels already
+                target_idx = batch_token_targets
+
+            ce_loss = F.cross_entropy(logits.reshape(-1, C), target_idx.reshape(-1).long())
+            self.log("train/batch_token_loss", ce_loss)
+            total_loss = total_loss + self.batch_token_weight * ce_loss
 
         if self.gene_decoder is not None and "pert_cell_counts" in batch:
             gene_targets = batch["pert_cell_counts"]
@@ -541,6 +610,25 @@ class StateTransitionPerturbationModel(PerturbationModel):
 
         loss = self.loss_fn(pred, target).mean()
         self.log("val_loss", loss)
+
+        if self.use_batch_token and self.batch_classifier is not None and self._token_features is not None:
+            logits = self.batch_classifier(self._token_features)
+            batch_token_targets = batch["batch"]
+
+            C  = logits.size(-1)
+            # Normalize labels to integer indices [B, 1]
+            # Assume one batch token per row in the batch (not per cell)
+            # logits: [B, C], batch_token_targets: [B] or [B, C] (one-hot)
+            if batch_token_targets.dim() > 1 and batch_token_targets.size(-1) == C:
+                # one-hot to indices
+                target_idx = batch_token_targets.argmax(-1)
+            else:
+                # integer labels already
+                target_idx = batch_token_targets
+
+            ce_loss = F.cross_entropy(logits.reshape(-1, C), target_idx.reshape(-1).long())
+            self.log("val/batch_token_loss", ce_loss)
+            loss = loss + self.batch_token_weight * ce_loss
 
         # Log individual loss components if using combined loss
         if hasattr(self.loss_fn, "sinkhorn_loss") and hasattr(self.loss_fn, "energy_loss"):
