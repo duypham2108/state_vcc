@@ -386,10 +386,13 @@ class StateTransitionPerturbationModel(PerturbationModel):
             self.transformer_backbone._attn_implementation = "eager"
 
             # create a [1,1,S,S] mask (now S+1 if confidence token is used)
-            base = torch.eye(seq_length, device=device).view(1, seq_length, seq_length)
+            base = torch.eye(seq_length, device=device, dtype=torch.bool).view(1, 1, seq_length, seq_length)
+            
+            # Get number of attention heads from model config
+            num_heads = self.transformer_backbone.config.num_attention_heads
 
             # repeat out to [B,H,S,S]
-            attn_mask = base.repeat(batch_size, 1, 1)
+            attn_mask = base.repeat(batch_size, num_heads, 1, 1)
 
             outputs = self.transformer_backbone(inputs_embeds=seq_input, attention_mask=attn_mask)
             transformer_output = outputs.last_hidden_state
