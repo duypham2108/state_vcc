@@ -158,46 +158,6 @@ class StateTransitionPerturbationModel(PerturbationModel):
         self.regularization = kwargs.get("regularization", 0.0)
         self.detach_decoder = kwargs.get("detach_decoder", False)
 
-        self.use_batch_token = kwargs.get("use_batch_token", False)
-        # Disable batch token only for truly incompatible cases
-        disable_reasons = []
-        if self.batch_encoder and self.use_batch_token:
-            disable_reasons.append("batch encoder is used")
-        if basal_mapping_strategy == "random" and self.use_batch_token:
-            disable_reasons.append("basal mapping strategy is random")
-
-        if disable_reasons:
-            self.use_batch_token = False
-            logger.warning(
-                f"Batch token is not supported when {' or '.join(disable_reasons)}, setting use_batch_token to False"
-            )
-            try:
-                self.hparams["use_batch_token"] = False
-            except Exception:
-                pass
-
-        self.batch_token_weight = kwargs.get("batch_token_weight", 0.1)
-        self.batch_token_num_classes: Optional[int] = batch_dim if self.use_batch_token else None
-
-        if self.use_batch_token:
-            if self.batch_token_num_classes is None:
-                raise ValueError("batch_token_num_classes must be set when use_batch_token is True")
-            self.batch_token = nn.Parameter(torch.randn(1, 1, self.hidden_dim))
-            self.batch_classifier = build_mlp(
-                in_dim=self.hidden_dim,
-                out_dim=self.batch_token_num_classes,
-                hidden_dim=self.hidden_dim,
-                n_layers=1,
-                dropout=self.dropout,
-                activation=self.activation_class,
-            )
-        else:
-            self.batch_token = None
-            self.batch_classifier = None
-
-        # Internal cache for last token features (B, S, H) from transformer for aux loss
-        self._batch_token_cache: Optional[torch.Tensor] = None
-
         self.transformer_backbone_key = transformer_backbone_key
         self.transformer_backbone_kwargs = transformer_backbone_kwargs
         self.transformer_backbone_kwargs["n_positions"] = self.cell_sentence_len + kwargs.get("extra_tokens", 0)
@@ -242,6 +202,46 @@ class StateTransitionPerturbationModel(PerturbationModel):
         is_gene_space = kwargs["embed_key"] == "X_hvg" or kwargs["embed_key"] is None
         if is_gene_space or self.gene_decoder is None:
             self.relu = torch.nn.ReLU()
+
+        self.use_batch_token = kwargs.get("use_batch_token", False)
+        # Disable batch token only for truly incompatible cases
+        disable_reasons = []
+        if self.batch_encoder and self.use_batch_token:
+            disable_reasons.append("batch encoder is used")
+        if basal_mapping_strategy == "random" and self.use_batch_token:
+            disable_reasons.append("basal mapping strategy is random")
+
+        if disable_reasons:
+            self.use_batch_token = False
+            logger.warning(
+                f"Batch token is not supported when {' or '.join(disable_reasons)}, setting use_batch_token to False"
+            )
+            try:
+                self.hparams["use_batch_token"] = False
+            except Exception:
+                pass
+
+        self.batch_token_weight = kwargs.get("batch_token_weight", 0.1)
+        self.batch_token_num_classes: Optional[int] = batch_dim if self.use_batch_token else None
+
+        if self.use_batch_token:
+            if self.batch_token_num_classes is None:
+                raise ValueError("batch_token_num_classes must be set when use_batch_token is True")
+            self.batch_token = nn.Parameter(torch.randn(1, 1, self.hidden_dim))
+            self.batch_classifier = build_mlp(
+                in_dim=self.hidden_dim,
+                out_dim=self.batch_token_num_classes,
+                hidden_dim=self.hidden_dim,
+                n_layers=1,
+                dropout=self.dropout,
+                activation=self.activation_class,
+            )
+        else:
+            self.batch_token = None
+            self.batch_classifier = None
+
+        # Internal cache for last token features (B, S, H) from transformer for aux loss
+        self._batch_token_cache: Optional[torch.Tensor] = None
 
         # initialize a confidence token
         self.confidence_token = None
