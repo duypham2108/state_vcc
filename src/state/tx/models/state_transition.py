@@ -204,6 +204,7 @@ class StateTransitionPerturbationModel(PerturbationModel):
             self.relu = torch.nn.ReLU()
 
         self.use_batch_token = kwargs.get("use_batch_token", False)
+        self.basal_mapping_strategy = basal_mapping_strategy
         # Disable batch token only for truly incompatible cases
         disable_reasons = []
         if self.batch_encoder and self.use_batch_token:
@@ -534,19 +535,38 @@ class StateTransitionPerturbationModel(PerturbationModel):
 
             # Prepare one label per sequence (all S cells share the same batch)
             if batch_token_targets.dim() > 1 and batch_token_targets.size(-1) == C:
-                # One-hot labels; reshape to [B, S, C] and take first position
+                # One-hot labels; reshape to [B, S, C]
                 if padded:
                     target_oh = batch_token_targets.reshape(-1, self.cell_sentence_len, C)
                 else:
                     target_oh = batch_token_targets.reshape(1, -1, C)
-                target_idx = target_oh[:, 0, :].argmax(-1)  # [B]
+                sentence_batch_labels = target_oh.argmax(-1)
             else:
-                # Integer labels; reshape to [B, S] and take first position
+                # Integer labels; reshape to [B, S]
                 if padded:
-                    target_int = batch_token_targets.reshape(-1, self.cell_sentence_len)
+                    sentence_batch_labels = batch_token_targets.reshape(-1, self.cell_sentence_len)
                 else:
-                    target_int = batch_token_targets.reshape(1, -1)
-                target_idx = target_int[:, 0]  # [B]
+                    sentence_batch_labels = batch_token_targets.reshape(1, -1)
+
+            if sentence_batch_labels.shape[0] != B:
+                sentence_batch_labels = sentence_batch_labels.reshape(B, -1)
+
+            if self.basal_mapping_strategy == "batch":
+                uniform_mask = sentence_batch_labels.eq(sentence_batch_labels[:, :1]).all(dim=1)
+                if not torch.all(uniform_mask):
+                    bad_indices = torch.where(~uniform_mask)[0]
+                    label_strings = []
+                    for idx in bad_indices:
+                        labels = sentence_batch_labels[idx].detach().cpu().tolist()
+                        logger.error("Batch labels for sentence %d: %s", idx.item(), labels)
+                        label_strings.append(f"sentence {idx.item()}: {labels}")
+                    raise ValueError(
+                        "Expected all cells in a sentence to share the same batch when "
+                        "basal_mapping_strategy is 'batch'. "
+                        f"Found mixed batch labels: {', '.join(label_strings)}"
+                    )
+
+            target_idx = sentence_batch_labels[:, 0]
 
             # Safety: ensure exactly one target per sequence
             if target_idx.numel() != B:
