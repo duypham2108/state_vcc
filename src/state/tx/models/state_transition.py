@@ -526,21 +526,33 @@ class StateTransitionPerturbationModel(PerturbationModel):
         total_loss = main_loss
 
         if self.use_batch_token and self.batch_classifier is not None and self._batch_token_cache is not None:
-            logits = self.batch_classifier(self._batch_token_cache)
+            logits = self.batch_classifier(self._batch_token_cache)  # [B, 1, C]
             batch_token_targets = batch["batch"]
 
-            C  = logits.size(-1)
-            # Normalize labels to integer indices [B, 1]
-            # Assume one batch token per row in the batch (not per cell)
-            # logits: [B, C], batch_token_targets: [B] or [B, C] (one-hot)
-            if batch_token_targets.dim() > 1 and batch_token_targets.size(-1) == C:
-                # one-hot to indices
-                target_idx = batch_token_targets.argmax(-1)
-            else:
-                # integer labels already
-                target_idx = batch_token_targets
+            B = logits.shape[0]
+            C = logits.size(-1)
 
-            ce_loss = F.cross_entropy(logits.reshape(-1, C), target_idx.reshape(-1).long())
+            # Prepare one label per sequence (all S cells share the same batch)
+            if batch_token_targets.dim() > 1 and batch_token_targets.size(-1) == C:
+                # One-hot labels; reshape to [B, S, C] and take first position
+                if padded:
+                    target_oh = batch_token_targets.reshape(-1, self.cell_sentence_len, C)
+                else:
+                    target_oh = batch_token_targets.reshape(1, -1, C)
+                target_idx = target_oh[:, 0, :].argmax(-1)  # [B]
+            else:
+                # Integer labels; reshape to [B, S] and take first position
+                if padded:
+                    target_int = batch_token_targets.reshape(-1, self.cell_sentence_len)
+                else:
+                    target_int = batch_token_targets.reshape(1, -1)
+                target_idx = target_int[:, 0]  # [B]
+
+            # Safety: ensure exactly one target per sequence
+            if target_idx.numel() != B:
+                target_idx = target_idx.reshape(-1)[:B]
+
+            ce_loss = F.cross_entropy(logits.reshape(B, -1, C).squeeze(1), target_idx.long())
             self.log("train/batch_token_loss", ce_loss)
             total_loss = total_loss + self.batch_token_weight * ce_loss
 
