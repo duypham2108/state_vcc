@@ -91,7 +91,7 @@ class ContextMeanPerturbationModel(PerturbationModel):
             return
 
         # Initialize dictionary to accumulate sum and count for each cell type.
-        celltype_sums = defaultdict(lambda: {"sum": torch.zeros(self.output_dim), "count": 0})
+        celltype_sums = defaultdict(lambda: {"sum": torch.zeros(self.output_dim), "count": 0, "control_sum": torch.zeros(self.output_dim), "control_count": 0})
 
         with torch.no_grad():
             for batch in train_loader:
@@ -108,22 +108,31 @@ class ContextMeanPerturbationModel(PerturbationModel):
                 pert_names = batch["pert_name"]
                 cell_types = batch["cell_type"]
 
-                # Iterate over batch samples and accumulate only perturbed cells
+                # Iterate over batch samples and accumulate perturbed and control cells
                 for i in range(len(X_cpu)):
                     p_name = str(pert_names[i])
                     ct_name = str(cell_types[i])
                     if p_name == self.control_pert:
-                        # Skip control cells
-                        continue
-                    celltype_sums[ct_name]["sum"] += X_cpu[i]
-                    celltype_sums[ct_name]["count"] += 1
+                        # Accumulate control cells
+                        celltype_sums[ct_name]["control_sum"] += X_cpu[i]
+                        celltype_sums[ct_name]["control_count"] += 1
+                    else:
+                        # Accumulate perturbed cells
+                        celltype_sums[ct_name]["sum"] += X_cpu[i]
+                        celltype_sums[ct_name]["count"] += 1
 
         # Compute the mean expression per cell type from the accumulated sums.
         for ct_name, stats in celltype_sums.items():
             if stats["count"] == 0:
-                logger.warning(f"No perturbed cells found for cell type {ct_name}.")
-                continue
-            self.celltype_pert_means[ct_name] = stats["sum"] / stats["count"]
+                if stats["control_count"] > 0:
+                    # Use control cell average as fallback for cell types with no perturbations
+                    self.celltype_pert_means[ct_name] = stats["control_sum"] / stats["control_count"]
+                    logger.info(f"ContextMean: Using control cell average for cell type '{ct_name}' (no perturbations found, {stats['control_count']} control cells used).")
+                else:
+                    logger.warning(f"No perturbed or control cells found for cell type {ct_name}.")
+                    continue
+            else:
+                self.celltype_pert_means[ct_name] = stats["sum"] / stats["count"]
 
         logger.info(
             f"ContextMean: computed average perturbed expression for {len(self.celltype_pert_means)} cell types."
