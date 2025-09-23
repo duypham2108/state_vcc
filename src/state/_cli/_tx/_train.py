@@ -250,7 +250,8 @@ def run_tx_train(cfg: DictConfig):
     # Decide on trainer params
     trainer_kwargs = dict(
         accelerator=accelerator,
-        devices=1,
+        devices=cfg["training"].get("devices", 1),
+        strategy=cfg["training"].get("strategy", "auto"),
         max_steps=cfg["training"]["max_steps"],  # for normal models
         check_val_every_n_epoch=None,
         val_check_interval=cfg["training"]["val_freq"],
@@ -258,6 +259,7 @@ def run_tx_train(cfg: DictConfig):
         plugins=plugins,
         callbacks=callbacks,
         gradient_clip_val=cfg["training"]["gradient_clip_val"] if cfg["model"]["name"].lower() != "cpa" else None,
+        use_distributed_sampler=False,  # Prevent Lightning from wrapping PerturbationBatchSampler with DistributedSampler
     )
 
     # Align logging cadence with rolling MFU window (and W&B logging)
