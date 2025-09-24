@@ -94,7 +94,7 @@ The cell lines and perturbations specified in the TOML should match the values a
 you can use the `tx predict` command:
 
 ```bash
-state tx predict --output_dir $HOME/state/test/ --checkpoint final.ckpt
+state tx predict --output-dir $HOME/state/test/ --checkpoint final.ckpt
 ```
 
 It will look in the `output_dir` above, for a `checkpoints` folder.
