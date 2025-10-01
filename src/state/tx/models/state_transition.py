@@ -442,11 +442,10 @@ class StateTransitionPerturbationModel(PerturbationModel):
             # repeat out to [B,H,S,S]
             attn_mask = base.repeat(batch_size, num_heads, 1, 1)
 
-            outputs = self.transformer_backbone(inputs_embeds=seq_input, attention_mask=attn_mask, output_attentions=True)
+            outputs = self.transformer_backbone(inputs_embeds=seq_input, attention_mask=attn_mask)
             transformer_output = outputs.last_hidden_state
         else:
-            attn_mask = torch.zeros((64, 1, 257, 257), dtype=torch.bool, device=seq_input.device)
-            outputs = self.transformer_backbone(inputs_embeds=seq_input, output_attentions=True, attention_mask=attn_mask)
+            outputs = self.transformer_backbone(inputs_embeds=seq_input)
             transformer_output = outputs.last_hidden_state
 
         # Extract outputs accounting for optional prepended batch token and optional confidence token at the end

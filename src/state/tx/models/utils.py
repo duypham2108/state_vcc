@@ -261,8 +261,16 @@ class LlamaBidirectionalModel(LlamaModel):
         
         # If no attention_mask is provided, create an all-ones mask (no masking)
         # This ensures bidirectional attention with correct device/dtype
-        
-            
+        if not attention_mask:
+            # Get batch size (B) and sequence length (S) from input_embeds if available, else from input_ids.
+            # If neither is available, fall back to attention_mask=None and log a warning.
+            B = None
+            S = None
+            if inputs_embeds is not None:
+                B, S = inputs_embeds.size(0), inputs_embeds.size(1)
+            if not attention_mask and B and S:
+                attention_mask = torch.ones((B, S), dtype=torch.bool, device=inputs_embeds.device if inputs_embeds is not None else input_ids.device)
+            attention_mask = torch.zeros((B, 1, S, S), dtype=torch.bool, device=inputs_embeds.device)
 
         return super().forward(
             input_ids=input_ids,
