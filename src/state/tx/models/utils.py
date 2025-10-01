@@ -247,7 +247,7 @@ class LlamaBidirectionalModel(LlamaModel):
     def forward(
         self,
         input_ids: torch.LongTensor = None,
-        attention_mask: torch.Tensor = None,
+        attention_mask: torch.Tensor | None = None,
         position_ids: torch.LongTensor = None,
         past_key_values=None,
         inputs_embeds: torch.FloatTensor = None,
@@ -261,14 +261,14 @@ class LlamaBidirectionalModel(LlamaModel):
         
         # If no attention_mask is provided, create an all-ones mask (no masking)
         # This ensures bidirectional attention with correct device/dtype
-        if not attention_mask:
+        if attention_mask is None:
             # Get batch size (B) and sequence length (S) from input_embeds if available, else from input_ids.
             # If neither is available, fall back to attention_mask=None and log a warning.
             B = None
             S = None
             if inputs_embeds is not None:
                 B, S = inputs_embeds.size(0), inputs_embeds.size(1)
-            if not attention_mask and B and S:
+            if B and S:
                 attention_mask = torch.ones((B, 1, S, S), dtype=torch.float, device=inputs_embeds.device)
 
         return super().forward(
