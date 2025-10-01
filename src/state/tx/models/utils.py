@@ -99,6 +99,8 @@ def get_loss_fn(loss: Union[str, nn.Module]) -> nn.Module:
 
 
 def get_transformer_backbone(key, kwargs) -> PreTrainedModel:
+    kwargs = dict(kwargs or {})
+
     if key == "GPT2":
         config = GPT2Config(**kwargs)
         model = GPT2BidirectionalModel(config)
@@ -110,9 +112,14 @@ def get_transformer_backbone(key, kwargs) -> PreTrainedModel:
         model.wte.weight.zero_()
 
         model_dim = config.n_embd
-    elif key == "llama":        
+    elif key == "llama":
+        bidirectional_attention = bool(kwargs.pop("bidirectional_attention", False))
+
         config = LlamaConfig(**kwargs)
-        model = LlamaBidirectionalModel(config)
+        if bidirectional_attention:
+            model = LlamaBidirectionalModel(config)
+        else:
+            model = LlamaModel(config)
         model_dim = config.hidden_size
 
         model.embed_tokens.weight.requires_grad = False

@@ -4,7 +4,7 @@ import pytest
 import torch
 from transformers import LlamaConfig, LlamaModel
 
-from state.tx.models.utils import LlamaBidirectionalModel
+from state.tx.models.utils import LlamaBidirectionalModel, get_transformer_backbone
 
 
 @pytest.fixture
@@ -55,6 +55,44 @@ def test_llama_bidirectional_update_causal_mask_returns_none(small_llama_config)
     
     # Should return None (no causal masking)
     assert result is None
+
+
+def test_get_transformer_backbone_llama_is_causal_by_default():
+    """get_transformer_backbone should return a causal LlamaModel unless opted in."""
+
+    kwargs = {
+        "vocab_size": 100,
+        "hidden_size": 64,
+        "intermediate_size": 128,
+        "num_hidden_layers": 2,
+        "num_attention_heads": 4,
+        "num_key_value_heads": 4,
+        "max_position_embeddings": 32,
+    }
+
+    model, model_dim = get_transformer_backbone("llama", kwargs)
+
+    assert type(model) is LlamaModel
+    assert model_dim == kwargs["hidden_size"]
+
+
+def test_get_transformer_backbone_llama_bidirectional_flag():
+    """Setting bidirectional_attention=True should opt into bidirectional Llama."""
+
+    kwargs = {
+        "vocab_size": 100,
+        "hidden_size": 64,
+        "intermediate_size": 128,
+        "num_hidden_layers": 2,
+        "num_attention_heads": 4,
+        "num_key_value_heads": 4,
+        "max_position_embeddings": 32,
+        "bidirectional_attention": True,
+    }
+
+    model, _ = get_transformer_backbone("llama", kwargs)
+
+    assert isinstance(model, LlamaBidirectionalModel)
 
 
 def test_llama_bidirectional_attention_vs_causal(small_llama_config):
