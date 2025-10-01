@@ -431,8 +431,7 @@ class StateTransitionPerturbationModel(PerturbationModel):
         if self.hparams.get("mask_attn", False):
             batch_size, seq_length, _ = seq_input.shape
             device = seq_input.device
-
-            self.transformer_backbone._attn_implementation = "eager"
+            self.transformer_backbone._attn_implementation = "eager"   # pyright: ignore[reportAttributeAccessIssue, reportArgumentType]
 
             # create a [1,1,S,S] mask (now S+1 if confidence token is used)
             base = torch.eye(seq_length, device=device, dtype=torch.bool).view(1, 1, seq_length, seq_length)
@@ -446,7 +445,8 @@ class StateTransitionPerturbationModel(PerturbationModel):
             outputs = self.transformer_backbone(inputs_embeds=seq_input, attention_mask=attn_mask)
             transformer_output = outputs.last_hidden_state
         else:
-            transformer_output = self.transformer_backbone(inputs_embeds=seq_input).last_hidden_state
+            outputs = self.transformer_backbone(inputs_embeds=seq_input)
+            transformer_output = outputs.last_hidden_state
 
         # Extract outputs accounting for optional prepended batch token and optional confidence token at the end
         if self.confidence_token is not None and self.use_batch_token and self.batch_token is not None:
