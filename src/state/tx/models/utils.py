@@ -269,7 +269,7 @@ class LlamaBidirectionalModel(LlamaModel):
             if inputs_embeds is not None:
                 B, S = inputs_embeds.size(0), inputs_embeds.size(1)
             if not attention_mask and B and S:
-                attention_mask = torch.zeros((B, 1, S, S), dtype=torch.bool, device=inputs_embeds.device)
+                attention_mask = torch.ones((B, 1, S, S), dtype=torch.float, device=inputs_embeds.device)
 
         return super().forward(
             input_ids=input_ids,
