@@ -340,14 +340,38 @@ class StateTransitionPerturbationModel(PerturbationModel):
                 nn.SiLU(),
                 nn.Linear(self.hidden_dim, self.hidden_dim),
             )
-            self._eps_predictor = build_mlp(
-                in_dim=self.output_dim,
-                out_dim=self.output_dim,
-                hidden_dim=max(256, self.output_dim),
-                n_layers=2,
-                dropout=self.dropout,
-                activation=self.activation_class,
-            )
+            # Build epsilon predictor with optional factorized bottleneck to reduce params
+            factorized = bool(diff_cfg.get("factorized", True))
+            if factorized:
+                bottleneck = int(diff_cfg.get("bottleneck_dim", max(256, min(self.hidden_dim, 1024))))
+                core_hidden = int(diff_cfg.get("eps_hidden_dim", bottleneck))
+                core_layers = int(diff_cfg.get("eps_n_layers", 2))
+                self._eps_in = nn.Linear(self.output_dim, bottleneck, bias=False)
+                self._eps_core = build_mlp(
+                    in_dim=bottleneck,
+                    out_dim=bottleneck,
+                    hidden_dim=core_hidden,
+                    n_layers=core_layers,
+                    dropout=self.dropout,
+                    activation=self.activation_class,
+                )
+                self._eps_out = nn.Linear(bottleneck, self.output_dim, bias=False)
+                self._eps_predictor = None
+            else:
+                # Non-factorized full MLP (large when output_dim is big)
+                core_hidden = int(diff_cfg.get("eps_hidden_dim", max(256, self.output_dim)))
+                core_layers = int(diff_cfg.get("eps_n_layers", 2))
+                self._eps_predictor = build_mlp(
+                    in_dim=self.output_dim,
+                    out_dim=self.output_dim,
+                    hidden_dim=core_hidden,
+                    n_layers=core_layers,
+                    dropout=self.dropout,
+                    activation=self.activation_class,
+                )
+                self._eps_in = None
+                self._eps_core = None
+                self._eps_out = None
             self._diff_loss_weight = float(diff_cfg.get("loss_weight", 1.0))
         else:
             self._diff_loss_weight = 0.0
@@ -717,7 +741,10 @@ class StateTransitionPerturbationModel(PerturbationModel):
             t_emb = self._get_timestep_embedding(t, self._time_mlp[0].in_features)
             t_feat = self._time_mlp(t_emb).unsqueeze(1)  # [B,1,H]
             # map r_t to eps
-            eps_pred = self._eps_predictor(r_t)  # [B,S,D_out]
+            if getattr(self, "_eps_in", None) is not None:
+                eps_pred = self._eps_out(self._eps_core(self._eps_in(r_t)))
+            else:
+                eps_pred = self._eps_predictor(r_t)  # [B,S,D_out]
             diff_loss = torch.mean((eps_pred - noise) ** 2)
             self.log("train/diffusion_loss", diff_loss)
             total_loss = total_loss + self._diff_loss_weight * diff_loss
