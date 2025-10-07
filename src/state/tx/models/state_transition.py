@@ -190,8 +190,10 @@ class StateTransitionPerturbationModel(PerturbationModel):
         self.gene_decoder_uses_hidden = False
         gene_ca_cfg = kwargs.get("gene_cross_attn", None)
         if gene_ca_cfg and gene_ca_cfg.get("enable", False):
+            genes_list = list(self.gene_names) if self.gene_names is not None else []
             self.gene_decoder = GeneCrossAttentionDecoder(
                 hidden_dim=self.hidden_dim,
+                genes=genes_list,
                 gene_embeddings=None,
                 gene_embeddings_path=gene_ca_cfg.get("gene_embeddings_path", None),
                 num_heads=gene_ca_cfg.get("heads", 4),

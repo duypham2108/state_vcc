@@ -2,7 +2,7 @@ import logging
 
 import torch
 import torch.nn as nn
-from typing import Optional
+from typing import Optional, Dict, List, Any
 from omegaconf import OmegaConf
 
 from ...emb.finetune_decoder import Finetune
@@ -133,43 +133,79 @@ class GeneCrossAttentionDecoder(nn.Module):
         self,
         *,
         hidden_dim: int,
-        gene_embeddings: Optional[torch.Tensor] = None,
+        genes: List[str],
+        gene_embeddings: Optional[Dict[str, torch.Tensor]] = None,
         gene_embeddings_path: Optional[str] = None,
         num_heads: int = 4,
         dropout: float = 0.1,
         freeze_embeddings: bool = True,
+        missing_init: str = "zeros",  # or "normal"
     ):
         super().__init__()
 
         if gene_embeddings is None and gene_embeddings_path is None:
-            raise ValueError("Provide either gene_embeddings tensor or gene_embeddings_path")
+            raise ValueError("Provide either gene_embeddings dict or gene_embeddings_path")
 
         if gene_embeddings is None:
-            loaded = torch.load(gene_embeddings_path)
+            loaded: Any = torch.load(gene_embeddings_path)
             if isinstance(loaded, dict) and "embeddings" in loaded:
-                gene_embeddings = loaded["embeddings"]
-            else:
-                gene_embeddings = loaded
-        if not isinstance(gene_embeddings, torch.Tensor):
-            raise TypeError("gene_embeddings must be a torch.Tensor")
+                loaded = loaded["embeddings"]
+            if not isinstance(loaded, dict):
+                raise TypeError("Loaded gene embeddings must be a dict[str, Tensor] or have key 'embeddings'")
+            gene_embeddings = {str(k): (v if isinstance(v, torch.Tensor) else torch.tensor(v)) for k, v in loaded.items()}
 
-        self.register_buffer("_gene_embeddings_buffer", gene_embeddings.float())
+        self.genes: List[str] = list(genes)
+        emb_list: List[torch.Tensor] = []
+        first_dim: Optional[int] = None
+        for g in self.genes:
+            vec = gene_embeddings.get(g)
+            if vec is None:
+                if first_dim is None:
+                    # try to infer dimension from any entry
+                    for _v in gene_embeddings.values():
+                        first_dim = int(_v.numel()) if _v.dim() == 1 else int(_v.shape[-1])
+                        break
+                dim = int(first_dim or 128)
+                if missing_init == "normal":
+                    vec = torch.randn(dim)
+                else:
+                    vec = torch.zeros(dim)
+            if vec.dim() > 1:
+                vec = vec.view(-1)
+            if first_dim is None:
+                first_dim = int(vec.numel())
+            elif vec.numel() != first_dim:
+                raise ValueError(f"Embedding dimension mismatch for gene {g}: {vec.numel()} vs {first_dim}")
+            emb_list.append(vec.float())
+
+        gene_matrix = torch.stack(emb_list, dim=0)  # [G, D]
+
         self._freeze_embeddings = freeze_embeddings
+        if freeze_embeddings:
+            self.register_buffer("_gene_embeddings", gene_matrix)
+            self._use_param = False
+        else:
+            self._gene_embeddings_param = nn.Parameter(gene_matrix)
+            self._use_param = True
 
-        in_dim = self._gene_embeddings_buffer.shape[1]
+        in_dim = gene_matrix.shape[1]
         self.project_gene = nn.Linear(in_dim, hidden_dim)
         self.attn = nn.MultiheadAttention(embed_dim=hidden_dim, num_heads=num_heads, dropout=dropout, batch_first=True)
         self.out = nn.Linear(hidden_dim, 1)
 
     def gene_dim(self) -> int:
-        return int(self._gene_embeddings_buffer.shape[0])
+        return len(self.genes)
+
+    def _gene_embeddings_tensor(self) -> torch.Tensor:
+        if self._use_param:
+            return self._gene_embeddings_param
+        else:
+            return self._gene_embeddings
 
     def forward(self, cell_latents: torch.Tensor) -> torch.Tensor:
         # cell_latents: [B, S, H]
         B = cell_latents.size(0)
-        gene_emb = self._gene_embeddings_buffer
-        if not self._freeze_embeddings and gene_emb.requires_grad is False:
-            gene_emb = gene_emb.clone().detach().requires_grad_(True)
+        gene_emb = self._gene_embeddings_tensor()
 
         gene_q = self.project_gene(gene_emb)  # [G, H]
         gene_q = gene_q.unsqueeze(0).expand(B, -1, -1)  # [B, G, H]
@@ -177,8 +213,6 @@ class GeneCrossAttentionDecoder(nn.Module):
         attn_out, _ = self.attn(query=gene_q, key=cell_latents, value=cell_latents)
         logits = self.out(attn_out).squeeze(-1)  # [B, G]
 
-        # Expand back to per-cell if needed: replicate per sequence cell
-        # Here we treat gene prediction per cell; broadcast to sequence length
         S = cell_latents.size(1)
         logits = logits.unsqueeze(1).expand(B, S, -1)  # [B, S, G]
         return logits
