@@ -2,6 +2,7 @@ import logging
 
 import torch
 import torch.nn as nn
+from typing import Optional
 from omegaconf import OmegaConf
 
 from ...emb.finetune_decoder import Finetune
@@ -125,3 +126,59 @@ class FinetuneVCICountsDecoder(nn.Module):
 
         # Pass through the additional decoder layers
         return decoded_gene + decoded_x
+
+
+class GeneCrossAttentionDecoder(nn.Module):
+    def __init__(
+        self,
+        *,
+        hidden_dim: int,
+        gene_embeddings: Optional[torch.Tensor] = None,
+        gene_embeddings_path: Optional[str] = None,
+        num_heads: int = 4,
+        dropout: float = 0.1,
+        freeze_embeddings: bool = True,
+    ):
+        super().__init__()
+
+        if gene_embeddings is None and gene_embeddings_path is None:
+            raise ValueError("Provide either gene_embeddings tensor or gene_embeddings_path")
+
+        if gene_embeddings is None:
+            loaded = torch.load(gene_embeddings_path)
+            if isinstance(loaded, dict) and "embeddings" in loaded:
+                gene_embeddings = loaded["embeddings"]
+            else:
+                gene_embeddings = loaded
+        if not isinstance(gene_embeddings, torch.Tensor):
+            raise TypeError("gene_embeddings must be a torch.Tensor")
+
+        self.register_buffer("_gene_embeddings_buffer", gene_embeddings.float())
+        self._freeze_embeddings = freeze_embeddings
+
+        in_dim = self._gene_embeddings_buffer.shape[1]
+        self.project_gene = nn.Linear(in_dim, hidden_dim)
+        self.attn = nn.MultiheadAttention(embed_dim=hidden_dim, num_heads=num_heads, dropout=dropout, batch_first=True)
+        self.out = nn.Linear(hidden_dim, 1)
+
+    def gene_dim(self) -> int:
+        return int(self._gene_embeddings_buffer.shape[0])
+
+    def forward(self, cell_latents: torch.Tensor) -> torch.Tensor:
+        # cell_latents: [B, S, H]
+        B = cell_latents.size(0)
+        gene_emb = self._gene_embeddings_buffer
+        if not self._freeze_embeddings and gene_emb.requires_grad is False:
+            gene_emb = gene_emb.clone().detach().requires_grad_(True)
+
+        gene_q = self.project_gene(gene_emb)  # [G, H]
+        gene_q = gene_q.unsqueeze(0).expand(B, -1, -1)  # [B, G, H]
+
+        attn_out, _ = self.attn(query=gene_q, key=cell_latents, value=cell_latents)
+        logits = self.out(attn_out).squeeze(-1)  # [B, G]
+
+        # Expand back to per-cell if needed: replicate per sequence cell
+        # Here we treat gene prediction per cell; broadcast to sequence length
+        S = cell_latents.size(1)
+        logits = logits.unsqueeze(1).expand(B, S, -1)  # [B, S, G]
+        return logits

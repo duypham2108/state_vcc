@@ -11,7 +11,7 @@ from geomloss import SamplesLoss
 from typing import Tuple
 
 from .base import PerturbationModel
-from .decoders import FinetuneVCICountsDecoder
+from .decoders import FinetuneVCICountsDecoder, GeneCrossAttentionDecoder
 from .decoders_nb import NBDecoder, nb_nll
 from .utils import build_mlp, get_activation_class, get_transformer_backbone, apply_lora
 
@@ -186,6 +186,20 @@ class StateTransitionPerturbationModel(PerturbationModel):
         # Build the underlying neural OT network
         self._build_networks(lora_cfg=kwargs.get("lora", None))
 
+        # Optional: gene cross-attention decoder
+        self.gene_decoder_uses_hidden = False
+        gene_ca_cfg = kwargs.get("gene_cross_attn", None)
+        if gene_ca_cfg and gene_ca_cfg.get("enable", False):
+            self.gene_decoder = GeneCrossAttentionDecoder(
+                hidden_dim=self.hidden_dim,
+                gene_embeddings=None,
+                gene_embeddings_path=gene_ca_cfg.get("gene_embeddings_path", None),
+                num_heads=gene_ca_cfg.get("heads", 4),
+                dropout=gene_ca_cfg.get("dropout", 0.1),
+                freeze_embeddings=gene_ca_cfg.get("freeze_embeddings", True),
+            )
+            self.gene_decoder_uses_hidden = True
+
         # Add an optional encoder that introduces a batch variable
         self.batch_encoder = None
         self.batch_dim = None
@@ -303,6 +317,39 @@ class StateTransitionPerturbationModel(PerturbationModel):
             )
         print(self)
 
+        # Diffusion (latent) configuration
+        diff_cfg = kwargs.get("diffusion", None)
+        self._diffusion_enabled = bool(diff_cfg and diff_cfg.get("enable", False))
+        if self._diffusion_enabled:
+            num_steps = int(diff_cfg.get("num_steps", 50))
+            beta1, beta2 = 1e-4, 0.02
+            schedule = diff_cfg.get("beta_schedule", "linear").lower()
+            if schedule == "cosine":
+                betas = self._cosine_beta_schedule(num_steps)
+            else:
+                betas = torch.linspace(beta1, beta2, num_steps)
+            alphas = 1.0 - betas
+            alphas_cumprod = torch.cumprod(alphas, dim=0)
+            self.register_buffer("_diff_betas", betas)
+            self.register_buffer("_diff_alphas_cumprod", alphas_cumprod)
+            time_dim = int(diff_cfg.get("time_embed_dim", 128))
+            self._time_mlp = nn.Sequential(
+                nn.Linear(time_dim, self.hidden_dim),
+                nn.SiLU(),
+                nn.Linear(self.hidden_dim, self.hidden_dim),
+            )
+            self._eps_predictor = build_mlp(
+                in_dim=self.output_dim,
+                out_dim=self.output_dim,
+                hidden_dim=max(256, self.output_dim),
+                n_layers=2,
+                dropout=self.dropout,
+                activation=self.activation_class,
+            )
+            self._diff_loss_weight = float(diff_cfg.get("loss_weight", 1.0))
+        else:
+            self._diff_loss_weight = 0.0
+
     def _build_networks(self, lora_cfg=None):
         """
         Here we instantiate the actual GPT2-based model.
@@ -360,6 +407,26 @@ class StateTransitionPerturbationModel(PerturbationModel):
                 nn.GELU(),
                 nn.Linear(self.output_dim // 8, self.output_dim),
             )
+
+    @staticmethod
+    def _get_timestep_embedding(timesteps: torch.Tensor, dim: int) -> torch.Tensor:
+        half = dim // 2
+        device = timesteps.device
+        freqs = torch.exp(-torch.arange(half, device=device, dtype=torch.float32) * (np.log(10000.0) / (half - 1)))
+        args = timesteps.float().unsqueeze(1) * freqs.unsqueeze(0)
+        emb = torch.cat([torch.cos(args), torch.sin(args)], dim=1)
+        if dim % 2 == 1:
+            emb = torch.nn.functional.pad(emb, (0, 1))
+        return emb
+
+    @staticmethod
+    def _cosine_beta_schedule(steps: int) -> torch.Tensor:
+        s = 0.008
+        t = torch.linspace(0, 1, steps + 1)
+        alphas_cumprod = torch.cos(((t + s) / (1 + s)) * np.pi * 0.5) ** 2
+        alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
+        betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
+        return betas.clamp(1e-5, 0.999)
 
     def encode_perturbation(self, pert: torch.Tensor) -> torch.Tensor:
         """If needed, define how we embed the raw perturbation input."""
@@ -592,6 +659,19 @@ class StateTransitionPerturbationModel(PerturbationModel):
             else:
                 latent_preds = pred
 
+            # If using cross-attention decoder, feed hidden states instead of output_dim
+            if getattr(self, "gene_decoder_uses_hidden", False):
+                # Recompute hidden states with current batch to get res_pred
+                S = self.cell_sentence_len if padded else batch["pert_emb"].shape[0]
+                pert = batch["pert_emb"].reshape(-1, S, self.pert_dim if padded else batch["pert_emb"].shape[-1])
+                basal = batch["ctrl_cell_emb"].reshape(-1, S, self.input_dim if padded else batch["ctrl_cell_emb"].shape[-1])
+                pert_embedding = self.encode_perturbation(pert)
+                control_cells = self.encode_basal_expression(basal)
+                seq_input = pert_embedding + control_cells
+                outputs = self.transformer_backbone(inputs_embeds=seq_input)
+                res_hidden = outputs.last_hidden_state
+                latent_preds = res_hidden
+
             if isinstance(self.gene_decoder, NBDecoder):
                 mu, theta = self.gene_decoder(latent_preds)
                 gene_targets = batch["pert_cell_counts"].reshape_as(mu)
@@ -609,6 +689,36 @@ class StateTransitionPerturbationModel(PerturbationModel):
             self.log("decoder_loss", decoder_loss)
 
             total_loss = total_loss + self.decoder_loss_weight * decoder_loss
+
+        # Diffusion loss on latent outputs (residual to control baseline)
+        if getattr(self, "_diffusion_enabled", False):
+            # Prepare target latent r (B, S, D_out)
+            target_latent = batch["pert_cell_emb"]
+            if padded:
+                target_latent = target_latent.reshape(-1, self.cell_sentence_len, self.output_dim)
+                basal = batch["ctrl_cell_emb"].reshape(-1, self.cell_sentence_len, self.input_dim)
+            else:
+                target_latent = target_latent.reshape(1, -1, self.output_dim)
+                basal = batch["ctrl_cell_emb"].reshape(1, -1, self.input_dim)
+            baseline_out = self.project_out(self.encode_basal_expression(basal))
+            r = target_latent - baseline_out if self.predict_residual else target_latent
+
+            T = self._diff_betas.numel()
+            bsz = r.size(0)
+            t = torch.randint(0, T, (bsz,), device=r.device)
+            alphas_cumprod = self._diff_alphas_cumprod
+            a_t = alphas_cumprod[t].view(-1, 1, 1)
+            noise = torch.randn_like(r)
+            r_t = a_t.sqrt() * r + (1 - a_t).sqrt() * noise
+
+            # time embed
+            t_emb = self._get_timestep_embedding(t, self._time_mlp[0].in_features)
+            t_feat = self._time_mlp(t_emb).unsqueeze(1)  # [B,1,H]
+            # map r_t to eps
+            eps_pred = self._eps_predictor(r_t)  # [B,S,D_out]
+            diff_loss = torch.mean((eps_pred - noise) ** 2)
+            self.log("train/diffusion_loss", diff_loss)
+            total_loss = total_loss + self._diff_loss_weight * diff_loss
 
         if confidence_pred is not None:
             # Detach main loss to prevent gradients flowing through it

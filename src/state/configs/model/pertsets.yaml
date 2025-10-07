@@ -37,3 +37,17 @@ kwargs:
       embd_pdrop: 0.0
       attn_pdrop: 0.0
       use_cache: false
+  # Optional light cross-attention gene decoder
+  gene_cross_attn:
+      enable: false
+      heads: 4
+      dropout: 0.1
+      freeze_embeddings: true
+      gene_embeddings_path: null
+  # Optional diffusion on latent outputs
+  diffusion:
+      enable: false
+      num_steps: 50
+      beta_schedule: cosine # linear|cosine
+      time_embed_dim: 128
+      loss_weight: 1.0
