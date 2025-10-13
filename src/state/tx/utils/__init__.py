@@ -261,6 +261,18 @@ def get_lightning_module(model_type: str, data_config: dict, model_config: dict,
             batch_dim=var_dims["batch_dim"],
             **module_config,
         )
+    elif model_type.lower() in ["lmm", "linear_mixed", "linear_mixed_model"]:
+        from ...tx.models.linear_mixed import LinearMixedPerturbationModel
+
+        return LinearMixedPerturbationModel(
+            input_dim=var_dims["input_dim"],
+            gene_dim=gene_dim,
+            hvg_dim=var_dims["hvg_dim"],
+            output_dim=var_dims["output_dim"],
+            pert_dim=var_dims["pert_dim"],
+            batch_dim=var_dims["batch_dim"],
+            **module_config,
+        )
     elif model_type.lower() == "cpa":
         from ...tx.models.cpa import CPAPerturbationModel
 
@@ -275,6 +287,18 @@ def get_lightning_module(model_type: str, data_config: dict, model_config: dict,
         from ...tx.models.scvi import SCVIPerturbationModel
 
         return SCVIPerturbationModel(
+            input_dim=var_dims["input_dim"],
+            gene_dim=gene_dim,
+            hvg_dim=var_dims["hvg_dim"],
+            output_dim=var_dims["output_dim"],
+            pert_dim=var_dims["pert_dim"],
+            batch_dim=var_dims["batch_dim"],
+            **module_config,
+        )
+    elif model_type.lower() in ["pca_linear", "pca+linear", "pca-additive"]:
+        from ...tx.models.pca_linear import PCALinearPerturbationModel
+
+        return PCALinearPerturbationModel(
             input_dim=var_dims["input_dim"],
             gene_dim=gene_dim,
             hvg_dim=var_dims["hvg_dim"],
