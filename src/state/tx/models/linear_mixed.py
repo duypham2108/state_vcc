@@ -32,7 +32,7 @@ class LinearMixedPerturbationModel(PerturbationModel):
     def __init__(
         self,
         input_dim: int,
-        hidden_dim: int = 0,
+        hidden_dim: int = 256,
         output_dim: int = 0,
         pert_dim: int = 0,
         batch_dim: Optional[int] = None,
@@ -59,8 +59,8 @@ class LinearMixedPerturbationModel(PerturbationModel):
         self.cell_sentence_len = int(kwargs.get("cell_set_len", 256))
 
         # Follow StateTransition template hyperparams
-        self.n_encoder_layers = kwargs.get("n_encoder_layers", 2)
-        self.n_decoder_layers = kwargs.get("n_decoder_layers", 2)
+        self.n_encoder_layers = kwargs.get("n_encoder_layers", 1)
+        self.n_decoder_layers = kwargs.get("n_decoder_layers", 1)
         self.activation_class = get_activation_class(kwargs.get("activation", "gelu"))
 
         # Build template-like networks (no transformer)
@@ -75,8 +75,7 @@ class LinearMixedPerturbationModel(PerturbationModel):
             # Random intercept in output space
             self.random_intercept = nn.Embedding(num_embeddings=batch_dim, embedding_dim=self.output_dim)
             # Fixed batch effect in hidden space
-            enc_hidden = self.hidden_dim if self.hidden_dim and self.hidden_dim > 0 else max(64, self.input_dim)
-            self.batch_encoder = nn.Embedding(num_embeddings=batch_dim, embedding_dim=enc_hidden)
+            self.batch_encoder = nn.Embedding(num_embeddings=batch_dim, embedding_dim=self.hidden_dim)
         else:
             self.random_intercept = None
             self.batch_encoder = None
@@ -89,7 +88,7 @@ class LinearMixedPerturbationModel(PerturbationModel):
             self.relu = None
 
     def _build_networks(self):
-        enc_hidden = self.hidden_dim if self.hidden_dim and self.hidden_dim > 0 else max(64, self.input_dim)
+        enc_hidden = self.hidden_dim if self.hidden_dim and self.hidden_dim > 0 else 256
 
         self.pert_encoder = build_mlp(
             in_dim=self.pert_dim,

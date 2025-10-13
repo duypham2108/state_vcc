@@ -1,3 +1,4 @@
+# pyright: reportMissingImports=false
 import logging
 from typing import Dict, Optional
 
@@ -13,7 +14,7 @@ from typing import Tuple
 from .base import PerturbationModel
 from .decoders import FinetuneVCICountsDecoder, GeneCrossAttentionDecoder
 from .decoders_nb import NBDecoder, nb_nll
-from .utils import build_mlp, get_activation_class, get_transformer_backbone, apply_lora
+from .utils import build_mlp, get_activation_class
 
 
 logger = logging.getLogger(__name__)
@@ -114,12 +115,12 @@ class StateTransitionPerturbationModel(PerturbationModel):
         hidden_dim: int,
         output_dim: int,
         pert_dim: int,
-        batch_dim: int = None,
+        batch_dim: Optional[int] = None,
         basal_mapping_strategy: str = "random",
         predict_residual: bool = True,
         distributional_loss: str = "energy",
         transformer_backbone_key: str = "GPT2",
-        transformer_backbone_kwargs: dict = None,
+        transformer_backbone_kwargs: Optional[dict] = None,
         output_space: str = "gene",
         gene_dim: Optional[int] = None,
         **kwargs,
@@ -135,14 +136,16 @@ class StateTransitionPerturbationModel(PerturbationModel):
             loss: choice of distributional metric ("sinkhorn", "energy", etc.).
             **kwargs: anything else to pass up to PerturbationModel or not used.
         """
+        # Compute effective gene_dim for strict typing
+        effective_gene_dim = int(gene_dim) if gene_dim is not None else int(input_dim)
         # Call the parent PerturbationModel constructor
         super().__init__(
             input_dim=input_dim,
             hidden_dim=hidden_dim,
-            gene_dim=gene_dim,
+            gene_dim=effective_gene_dim,
             output_dim=output_dim,
             pert_dim=pert_dim,
-            batch_dim=batch_dim,
+            batch_dim=(0 if batch_dim is None else int(batch_dim)),
             output_space=output_space,
             **kwargs,
         )
@@ -158,12 +161,12 @@ class StateTransitionPerturbationModel(PerturbationModel):
         self.regularization = kwargs.get("regularization", 0.0)
         self.detach_decoder = kwargs.get("detach_decoder", False)
 
+        # Backward-compat placeholders (ignored in light cross-attention implementation)
         self.transformer_backbone_key = transformer_backbone_key
-        self.transformer_backbone_kwargs = transformer_backbone_kwargs
-        self.transformer_backbone_kwargs["n_positions"] = self.cell_sentence_len + kwargs.get("extra_tokens", 0)
+        self.transformer_backbone_kwargs = transformer_backbone_kwargs or {}
 
         self.distributional_loss = distributional_loss
-        self.gene_dim = gene_dim
+        self.gene_dim = effective_gene_dim
 
         # Build the distributional loss from geomloss
         blur = kwargs.get("blur", 0.05)
@@ -270,20 +273,20 @@ class StateTransitionPerturbationModel(PerturbationModel):
         # Backward-compat: accept legacy key `freeze_pert`
         self.freeze_pert_backbone = kwargs.get("freeze_pert_backbone", kwargs.get("freeze_pert", False))
         if self.freeze_pert_backbone:
-            # Freeze backbone base weights but keep LoRA adapter weights (if present) trainable
-            for name, param in self.transformer_backbone.named_parameters():
-                if "lora_" in name:
-                    param.requires_grad = True
-                else:
+            # In light cross-attention setup, freeze attention and projection layers instead
+            if hasattr(self, "cross_attn"):
+                for _, param in self.cross_attn.named_parameters():
                     param.requires_grad = False
-            # Freeze projection head as before
+            if hasattr(self, "cross_attn_out"):
+                for _, param in self.cross_attn_out.named_parameters():
+                    param.requires_grad = False
             for param in self.project_out.parameters():
                 param.requires_grad = False
 
         if kwargs.get("nb_decoder", False):
             self.gene_decoder = NBDecoder(
                 latent_dim=self.output_dim + (self.batch_dim or 0),
-                gene_dim=gene_dim,
+                gene_dim=effective_gene_dim,
                 hidden_dims=[512, 512, 512],
                 dropout=self.dropout,
             )
@@ -319,66 +322,11 @@ class StateTransitionPerturbationModel(PerturbationModel):
             )
         print(self)
 
-        # Diffusion (latent) configuration
-        diff_cfg = kwargs.get("diffusion", None)
-        self._diffusion_enabled = bool(diff_cfg and diff_cfg.get("enable", False))
-        if self._diffusion_enabled:
-            num_steps = int(diff_cfg.get("num_steps", 50))
-            beta1, beta2 = 1e-4, 0.02
-            schedule = diff_cfg.get("beta_schedule", "linear").lower()
-            if schedule == "cosine":
-                betas = self._cosine_beta_schedule(num_steps)
-            else:
-                betas = torch.linspace(beta1, beta2, num_steps)
-            alphas = 1.0 - betas
-            alphas_cumprod = torch.cumprod(alphas, dim=0)
-            self.register_buffer("_diff_betas", betas)
-            self.register_buffer("_diff_alphas_cumprod", alphas_cumprod)
-            time_dim = int(diff_cfg.get("time_embed_dim", 128))
-            self._time_mlp = nn.Sequential(
-                nn.Linear(time_dim, self.hidden_dim),
-                nn.SiLU(),
-                nn.Linear(self.hidden_dim, self.hidden_dim),
-            )
-            # Build epsilon predictor with optional factorized bottleneck to reduce params
-            factorized = bool(diff_cfg.get("factorized", True))
-            if factorized:
-                bottleneck = int(diff_cfg.get("bottleneck_dim", max(256, min(self.hidden_dim, 1024))))
-                core_hidden = int(diff_cfg.get("eps_hidden_dim", bottleneck))
-                core_layers = int(diff_cfg.get("eps_n_layers", 2))
-                self._eps_in = nn.Linear(self.output_dim, bottleneck, bias=False)
-                self._eps_core = build_mlp(
-                    in_dim=bottleneck,
-                    out_dim=bottleneck,
-                    hidden_dim=core_hidden,
-                    n_layers=core_layers,
-                    dropout=self.dropout,
-                    activation=self.activation_class,
-                )
-                self._eps_out = nn.Linear(bottleneck, self.output_dim, bias=False)
-                self._eps_predictor = None
-            else:
-                # Non-factorized full MLP (large when output_dim is big)
-                core_hidden = int(diff_cfg.get("eps_hidden_dim", max(256, self.output_dim)))
-                core_layers = int(diff_cfg.get("eps_n_layers", 2))
-                self._eps_predictor = build_mlp(
-                    in_dim=self.output_dim,
-                    out_dim=self.output_dim,
-                    hidden_dim=core_hidden,
-                    n_layers=core_layers,
-                    dropout=self.dropout,
-                    activation=self.activation_class,
-                )
-                self._eps_in = None
-                self._eps_core = None
-                self._eps_out = None
-            self._diff_loss_weight = float(diff_cfg.get("loss_weight", 1.0))
-        else:
-            self._diff_loss_weight = 0.0
+        # Diffusion removed in light cross-attention implementation
 
     def _build_networks(self, lora_cfg=None):
         """
-        Here we instantiate the actual GPT2-based model.
+        Build lightweight linear cross-attention model.
         """
         self.pert_encoder = build_mlp(
             in_dim=self.pert_dim,
@@ -402,18 +350,15 @@ class StateTransitionPerturbationModel(PerturbationModel):
         else:
             self.basal_encoder = nn.Linear(self.input_dim, self.hidden_dim)
 
-        self.transformer_backbone, self.transformer_model_dim = get_transformer_backbone(
-            self.transformer_backbone_key,
-            self.transformer_backbone_kwargs,
+        # Single-layer light cross-attention: queries from perturbation, keys/values from control
+        attn_heads = int(self.hparams.get("attn_heads", 4)) if hasattr(self, "hparams") else int(lora_cfg.get("attn_heads", 4) if lora_cfg else 4)
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=self.hidden_dim,
+            num_heads=attn_heads,
+            dropout=self.dropout,
+            batch_first=True,
         )
-
-        # Optionally wrap backbone with LoRA adapters
-        if lora_cfg and lora_cfg.get("enable", False):
-            self.transformer_backbone = apply_lora(
-                self.transformer_backbone,
-                self.transformer_backbone_key,
-                lora_cfg,
-            )
+        self.cross_attn_out = nn.Linear(self.hidden_dim, self.hidden_dim)
 
         # Project from input_dim to hidden_dim for transformer input
         # self.project_to_hidden = nn.Linear(self.input_dim, self.hidden_dim)
@@ -434,25 +379,7 @@ class StateTransitionPerturbationModel(PerturbationModel):
                 nn.Linear(self.output_dim // 8, self.output_dim),
             )
 
-    @staticmethod
-    def _get_timestep_embedding(timesteps: torch.Tensor, dim: int) -> torch.Tensor:
-        half = dim // 2
-        device = timesteps.device
-        freqs = torch.exp(-torch.arange(half, device=device, dtype=torch.float32) * (np.log(10000.0) / (half - 1)))
-        args = timesteps.float().unsqueeze(1) * freqs.unsqueeze(0)
-        emb = torch.cat([torch.cos(args), torch.sin(args)], dim=1)
-        if dim % 2 == 1:
-            emb = torch.nn.functional.pad(emb, (0, 1))
-        return emb
-
-    @staticmethod
-    def _cosine_beta_schedule(steps: int) -> torch.Tensor:
-        s = 0.008
-        t = torch.linspace(0, 1, steps + 1)
-        alphas_cumprod = torch.cos(((t + s) / (1 + s)) * np.pi * 0.5) ** 2
-        alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
-        betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
-        return betas.clamp(1e-5, 0.999)
+    # Diffusion helper methods removed
 
     def encode_perturbation(self, pert: torch.Tensor) -> torch.Tensor:
         """If needed, define how we embed the raw perturbation input."""
@@ -521,48 +448,15 @@ class StateTransitionPerturbationModel(PerturbationModel):
             seq_input = self.confidence_token.append_confidence_token(seq_input)
 
         # forward pass + extract CLS last hidden state
-        if self.hparams.get("mask_attn", False):
-            batch_size, seq_length, _ = seq_input.shape
-            device = seq_input.device
-            self.transformer_backbone._attn_implementation = "eager"   # pyright: ignore[reportAttributeAccessIssue, reportArgumentType]
-
-            # create a [1,1,S,S] mask (now S+1 if confidence token is used)
-            base = torch.eye(seq_length, device=device, dtype=torch.bool).view(1, 1, seq_length, seq_length)
-            
-            # Get number of attention heads from model config
-            num_heads = self.transformer_backbone.config.num_attention_heads
-
-            # repeat out to [B,H,S,S]
-            attn_mask = base.repeat(batch_size, num_heads, 1, 1)
-
-            outputs = self.transformer_backbone(inputs_embeds=seq_input, attention_mask=attn_mask)
-            transformer_output = outputs.last_hidden_state
-        else:
-            outputs = self.transformer_backbone(inputs_embeds=seq_input)
-            transformer_output = outputs.last_hidden_state
+        # Light cross-attention (queries: pert; keys/values: control)
+        attn_output, _ = self.cross_attn(query=pert_embedding, key=control_cells, value=control_cells)
+        # Optional linear projection after attention
+        transformer_output = self.cross_attn_out(attn_output)
 
         # Extract outputs accounting for optional prepended batch token and optional confidence token at the end
-        if self.confidence_token is not None and self.use_batch_token and self.batch_token is not None:
-            # transformer_output: [B, 1 + S + 1, H] -> batch token at 0, cells 1..S, confidence at -1
-            batch_token_pred = transformer_output[:, :1, :]  # [B, 1, H]
-            res_pred, confidence_pred = self.confidence_token.extract_confidence_prediction(
-                transformer_output[:, 1:, :]
-            )
-            # res_pred currently excludes the confidence token and starts from former index 1
-            self._batch_token_cache = batch_token_pred
-        elif self.confidence_token is not None:
-            # Only confidence token appended at the end
-            res_pred, confidence_pred = self.confidence_token.extract_confidence_prediction(transformer_output)
-            self._batch_token_cache = None
-        elif self.use_batch_token and self.batch_token is not None:
-            # Only batch token prepended at the beginning
-            batch_token_pred = transformer_output[:, :1, :]  # [B, 1, H]
-            res_pred = transformer_output[:, 1:, :]  # [B, S, H]
-            self._batch_token_cache = batch_token_pred
-        else:
-            # Neither special token used
-            res_pred = transformer_output
-            self._batch_token_cache = None
+        # No special tokens used in light cross-attention path
+        res_pred = transformer_output
+        self._batch_token_cache = None
 
         # add to basal if predicting residual
         if self.predict_residual and self.output_space == "all":
@@ -687,15 +581,14 @@ class StateTransitionPerturbationModel(PerturbationModel):
 
             # If using cross-attention decoder, feed hidden states instead of output_dim
             if getattr(self, "gene_decoder_uses_hidden", False):
-                # Recompute hidden states with current batch to get res_pred
+                # Recompute hidden states with current batch using light cross-attention
                 S = self.cell_sentence_len if padded else batch["pert_emb"].shape[0]
                 pert = batch["pert_emb"].reshape(-1, S, self.pert_dim if padded else batch["pert_emb"].shape[-1])
                 basal = batch["ctrl_cell_emb"].reshape(-1, S, self.input_dim if padded else batch["ctrl_cell_emb"].shape[-1])
                 pert_embedding = self.encode_perturbation(pert)
                 control_cells = self.encode_basal_expression(basal)
-                seq_input = pert_embedding + control_cells
-                outputs = self.transformer_backbone(inputs_embeds=seq_input)
-                res_hidden = outputs.last_hidden_state
+                res_hidden, _ = self.cross_attn(query=pert_embedding, key=control_cells, value=control_cells)
+                res_hidden = self.cross_attn_out(res_hidden)
                 latent_preds = res_hidden
 
             if isinstance(self.gene_decoder, NBDecoder):
@@ -716,40 +609,9 @@ class StateTransitionPerturbationModel(PerturbationModel):
 
             total_loss = total_loss + self.decoder_loss_weight * decoder_loss
 
-        # Diffusion loss on latent outputs (residual to control baseline)
-        if getattr(self, "_diffusion_enabled", False):
-            # Prepare target latent r (B, S, D_out)
-            target_latent = batch["pert_cell_emb"]
-            if padded:
-                target_latent = target_latent.reshape(-1, self.cell_sentence_len, self.output_dim)
-                basal = batch["ctrl_cell_emb"].reshape(-1, self.cell_sentence_len, self.input_dim)
-            else:
-                target_latent = target_latent.reshape(1, -1, self.output_dim)
-                basal = batch["ctrl_cell_emb"].reshape(1, -1, self.input_dim)
-            baseline_out = self.project_out(self.encode_basal_expression(basal))
-            r = target_latent - baseline_out if self.predict_residual else target_latent
+        # Diffusion removed
 
-            T = self._diff_betas.numel()
-            bsz = r.size(0)
-            t = torch.randint(0, T, (bsz,), device=r.device)
-            alphas_cumprod = self._diff_alphas_cumprod
-            a_t = alphas_cumprod[t].view(-1, 1, 1)
-            noise = torch.randn_like(r)
-            r_t = a_t.sqrt() * r + (1 - a_t).sqrt() * noise
-
-            # time embed
-            t_emb = self._get_timestep_embedding(t, self._time_mlp[0].in_features)
-            t_feat = self._time_mlp(t_emb).unsqueeze(1)  # [B,1,H]
-            # map r_t to eps
-            if getattr(self, "_eps_in", None) is not None:
-                eps_pred = self._eps_out(self._eps_core(self._eps_in(r_t)))
-            else:
-                eps_pred = self._eps_predictor(r_t)  # [B,S,D_out]
-            diff_loss = torch.mean((eps_pred - noise) ** 2)
-            self.log("train/diffusion_loss", diff_loss)
-            total_loss = total_loss + self._diff_loss_weight * diff_loss
-
-        if confidence_pred is not None:
+        if confidence_pred is not None and self.confidence_loss_fn is not None:
             # Detach main loss to prevent gradients flowing through it
             loss_target = total_loss.detach().clone().unsqueeze(0) * 10
 
@@ -830,7 +692,7 @@ class StateTransitionPerturbationModel(PerturbationModel):
             self.log("val/decoder_loss", decoder_loss)
             loss = loss + self.decoder_loss_weight * decoder_loss
 
-        if confidence_pred is not None:
+        if confidence_pred is not None and self.confidence_loss_fn is not None:
             # Detach main loss to prevent gradients flowing through it
             loss_target = loss.detach().clone() * 10
 
@@ -844,8 +706,7 @@ class StateTransitionPerturbationModel(PerturbationModel):
             confidence_loss = self.confidence_loss_fn(confidence_pred.squeeze(), loss_target.squeeze())
             self.log("val/confidence_loss", confidence_loss)
             self.log("val/actual_loss", loss_target.mean())
-
-        return {"loss": loss, "predictions": pred}
+        return None
 
     def test_step(self, batch: Dict[str, torch.Tensor], batch_idx: int) -> None:
         if self.confidence_token is None:
@@ -859,7 +720,7 @@ class StateTransitionPerturbationModel(PerturbationModel):
         loss = self.loss_fn(pred, target).mean()
         self.log("test_loss", loss)
 
-        if confidence_pred is not None:
+        if confidence_pred is not None and self.confidence_loss_fn is not None:
             # Detach main loss to prevent gradients flowing through it
             loss_target = loss.detach().clone() * 10.0
 
