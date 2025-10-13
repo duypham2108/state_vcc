@@ -235,9 +235,10 @@ class PCALinearPerturbationModel(PerturbationModel):
     def forward(self, batch: dict, padded: bool = True) -> torch.Tensor:
         # Expect counts (or fallback embeddings) for decoding
         ctrl_source = self._get_ctrl_counts_tensor(batch)
+        feature_dim = ctrl_source.shape[-1]
 
         if padded:
-            ctrl_counts = ctrl_source.reshape(-1, self.cell_sentence_len, self.gene_dim)
+            ctrl_counts = ctrl_source.reshape(-1, self.cell_sentence_len, feature_dim)
             pert = batch["pert_emb"].reshape(-1, self.cell_sentence_len, self.pert_dim)
             batch_idx = batch.get("batch", None)
             if batch_idx is not None:
@@ -246,7 +247,7 @@ class PCALinearPerturbationModel(PerturbationModel):
                 elif batch_idx.dim() == 3:
                     batch_idx = batch_idx.reshape(-1, self.cell_sentence_len, batch_idx.size(-1))
         else:
-            ctrl_counts = ctrl_source.reshape(1, -1, self.gene_dim)
+            ctrl_counts = ctrl_source.reshape(1, -1, feature_dim)
             pert = batch["pert_emb"].reshape(1, -1, self.pert_dim)
             batch_idx = batch.get("batch", None)
             if batch_idx is not None:
@@ -337,13 +338,14 @@ class PCALinearPerturbationModel(PerturbationModel):
     def training_step(self, batch: Dict[str, torch.Tensor], batch_idx: int, padded: bool = True) -> torch.Tensor:
         pred = self.forward(batch, padded=padded)
         target = self._get_pert_counts_tensor(batch)
+        G = pred.shape[-1]
         B = pred.shape[0] // self.cell_sentence_len if padded else 1
         if padded:
-            pred = pred.reshape(B, self.cell_sentence_len, self.gene_dim)
-            target = target.reshape(B, self.cell_sentence_len, self.gene_dim)
+            pred = pred.reshape(B, self.cell_sentence_len, G)
+            target = target.reshape(B, self.cell_sentence_len, G)
         else:
-            pred = pred.reshape(1, -1, self.gene_dim)
-            target = target.reshape(1, -1, self.gene_dim)
+            pred = pred.reshape(1, -1, G)
+            target = target.reshape(1, -1, G)
 
         loss = self.loss_fn(pred, target).nanmean()
         self.log("train_loss", loss)
@@ -351,8 +353,9 @@ class PCALinearPerturbationModel(PerturbationModel):
 
     def validation_step(self, batch: Dict[str, torch.Tensor], batch_idx: int) -> None:
         pred = self.forward(batch)
-        target = self._get_pert_counts_tensor(batch).reshape(-1, self.cell_sentence_len, self.gene_dim)
-        pred = pred.reshape(-1, self.cell_sentence_len, self.gene_dim)
+        G = pred.shape[-1]
+        target = self._get_pert_counts_tensor(batch).reshape(-1, self.cell_sentence_len, G)
+        pred = pred.reshape(-1, self.cell_sentence_len, G)
         loss = self.loss_fn(pred, target).mean()
         self.log("val_loss", loss)
         return None

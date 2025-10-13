@@ -75,8 +75,12 @@ def run_tx_train(cfg: DictConfig):
         else:
             try:
                 sentence_len = cfg["model"]["kwargs"]["transformer_backbone_kwargs"]["n_positions"]
-            except:
-                sentence_len = cfg["model"]["kwargs"]["transformer_backbone_kwargs"]["max_position_embeddings"]
+            except Exception:
+                try:
+                    sentence_len = cfg["model"]["kwargs"]["transformer_backbone_kwargs"]["max_position_embeddings"]
+                except Exception:
+                    # Fallback for non-transformer models (e.g., lmm, pca_linear)
+                    sentence_len = int(cfg["model"]["kwargs"].get("cell_set_len", 256))
 
     if cfg["model"]["name"].lower().startswith("scgpt"):  # scGPT uses log-normalized expression
         cfg["data"]["kwargs"]["transform"] = "log-normalize"
