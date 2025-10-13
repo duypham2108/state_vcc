@@ -216,13 +216,28 @@ class PCALinearPerturbationModel(PerturbationModel):
             return batch_tensor.argmax(-1)
         return batch_tensor.long()
 
+    def _get_ctrl_counts_tensor(self, batch: dict) -> torch.Tensor:
+        # Prefer explicit counts; else fall back to embeddings if provided
+        if "ctrl_cell_counts" in batch and batch["ctrl_cell_counts"] is not None:
+            return batch["ctrl_cell_counts"]
+        if "ctrl_cell_emb" in batch and batch["ctrl_cell_emb"] is not None:
+            return batch["ctrl_cell_emb"]
+        raise KeyError("ctrl_cell_counts missing; PCALinearPerturbationModel requires counts in batch")
+
+    def _get_pert_counts_tensor(self, batch: dict) -> torch.Tensor:
+        # Prefer explicit counts; else fall back to embeddings if provided
+        if "pert_cell_counts" in batch and batch["pert_cell_counts"] is not None:
+            return batch["pert_cell_counts"]
+        if "pert_cell_emb" in batch and batch["pert_cell_emb"] is not None:
+            return batch["pert_cell_emb"]
+        raise KeyError("pert_cell_counts missing; PCALinearPerturbationModel requires counts in batch")
+
     def forward(self, batch: dict, padded: bool = True) -> torch.Tensor:
-        # Expect counts for decoding
-        if "ctrl_cell_counts" not in batch:
-            raise KeyError("ctrl_cell_counts missing; PCALinearPerturbationModel requires counts in batch")
+        # Expect counts (or fallback embeddings) for decoding
+        ctrl_source = self._get_ctrl_counts_tensor(batch)
 
         if padded:
-            ctrl_counts = batch["ctrl_cell_counts"].reshape(-1, self.cell_sentence_len, self.gene_dim)
+            ctrl_counts = ctrl_source.reshape(-1, self.cell_sentence_len, self.gene_dim)
             pert = batch["pert_emb"].reshape(-1, self.cell_sentence_len, self.pert_dim)
             batch_idx = batch.get("batch", None)
             if batch_idx is not None:
@@ -231,7 +246,7 @@ class PCALinearPerturbationModel(PerturbationModel):
                 elif batch_idx.dim() == 3:
                     batch_idx = batch_idx.reshape(-1, self.cell_sentence_len, batch_idx.size(-1))
         else:
-            ctrl_counts = batch["ctrl_cell_counts"].reshape(1, -1, self.gene_dim)
+            ctrl_counts = ctrl_source.reshape(1, -1, self.gene_dim)
             pert = batch["pert_emb"].reshape(1, -1, self.pert_dim)
             batch_idx = batch.get("batch", None)
             if batch_idx is not None:
@@ -321,10 +336,7 @@ class PCALinearPerturbationModel(PerturbationModel):
 
     def training_step(self, batch: Dict[str, torch.Tensor], batch_idx: int, padded: bool = True) -> torch.Tensor:
         pred = self.forward(batch, padded=padded)
-        if "pert_cell_counts" not in batch:
-            raise KeyError("pert_cell_counts missing; PCALinearPerturbationModel trains on counts")
-
-        target = batch["pert_cell_counts"]
+        target = self._get_pert_counts_tensor(batch)
         B = pred.shape[0] // self.cell_sentence_len if padded else 1
         if padded:
             pred = pred.reshape(B, self.cell_sentence_len, self.gene_dim)
@@ -339,7 +351,7 @@ class PCALinearPerturbationModel(PerturbationModel):
 
     def validation_step(self, batch: Dict[str, torch.Tensor], batch_idx: int) -> None:
         pred = self.forward(batch)
-        target = batch["pert_cell_counts"].reshape(-1, self.cell_sentence_len, self.gene_dim)
+        target = self._get_pert_counts_tensor(batch).reshape(-1, self.cell_sentence_len, self.gene_dim)
         pred = pred.reshape(-1, self.cell_sentence_len, self.gene_dim)
         loss = self.loss_fn(pred, target).mean()
         self.log("val_loss", loss)
