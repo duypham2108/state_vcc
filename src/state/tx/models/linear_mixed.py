@@ -1,6 +1,7 @@
 import logging
 from typing import Dict, Optional
 
+# pyright: reportMissingImports=false
 import torch
 import torch.nn as nn
 
@@ -114,8 +115,8 @@ class LinearMixedPerturbationModel(PerturbationModel):
                 elif batch_idx.dim() == 2:
                     batch_idx = batch_idx.reshape(1, -1, batch_idx.size(-1))
 
-        # Fixed effects
-        ctrl_eff = self.fixed_ctrl(basal) if not self.predict_residual else basal
+        # Fixed effects (map both to output_dim to ensure shape alignment)
+        ctrl_eff = self.fixed_ctrl(basal)
         pert_eff = self.fixed_pert(pert)
 
         # Random intercept
@@ -128,7 +129,14 @@ class LinearMixedPerturbationModel(PerturbationModel):
         # Combine
         # Broadcast intercept to [B, S, D]
         intercept = self.intercept.view(1, 1, -1)
-        y_hat = ctrl_eff + pert_eff + intercept + rand_eff
+
+        # Ensure rand_eff is broadcastable
+        if isinstance(rand_eff, float):
+            rand_eff_t = 0.0
+        else:
+            rand_eff_t = rand_eff
+
+        y_hat = ctrl_eff + pert_eff + intercept + (rand_eff_t if not isinstance(rand_eff_t, float) else 0.0)
 
         # If output is gene space, apply ReLU to enforce non-negativity
         if self.relu is not None:
