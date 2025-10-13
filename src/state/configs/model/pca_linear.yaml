@@ -1,0 +1,23 @@
+name: PCALinear
+checkpoint: null
+device: cuda
+
+# Used by training script to determine sentence length when not using transformers
+cell_set_len: 256
+
+kwargs:
+  # PCA components
+  pca_dim: 256
+
+  # Enable to add a per-batch random intercept in PCA space
+  batch_encoder: false
+
+  # Optional files to enhance model
+  # Path to a torch.load()-able dict: {pert_name: 1D tensor}
+  perturbation_features_file: null
+  # Path to a torch.load()-able dict: {gene_name: 1D tensor}
+  gene_embeddings_path: null
+
+  # Loss defaults to MSE in the base class; override if desired
+  # loss: mse
+

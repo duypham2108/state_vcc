@@ -65,8 +65,10 @@ class PCALinearPerturbationModel(PerturbationModel):
         self._pca_components_: Optional[np.ndarray] = None
         self._pca_mean_: Optional[np.ndarray] = None
 
-        # Linear mapping from pert embeddings to PCA space (additive effect)
-        self.pert_to_pca = nn.Linear(self.pert_dim, self.pca_dim, bias=False)
+        # Linear mapping from pert embeddings (and optional external features) to PCA space
+        self._pert_feat_dim = None  # will be set if external features are provided
+        self.pert_to_pca: nn.Linear
+        self._init_pert_mapping(input_dim=self.pert_dim, kwargs=kwargs)
         self.pca_intercept = nn.Parameter(torch.zeros(self.pca_dim))
 
         # Optional random intercept per batch in PCA space
@@ -80,9 +82,115 @@ class PCALinearPerturbationModel(PerturbationModel):
         is_gene_space = kwargs.get("embed_key") == "X_hvg" or kwargs.get("embed_key") is None
         self.relu = nn.ReLU() if is_gene_space else None
 
+        # Optional pretrained gene embeddings for decoding correction
+        self._use_gene_embeddings = False
+        self._gene_emb_matrix: Optional[torch.Tensor] = None  # [G, E]
+        self._gene_emb_proj: Optional[nn.Linear] = None  # maps PCA delta -> gene-emb space or counts
+        self._init_gene_embeddings(kwargs)
+
     def _build_networks(self):
         # No deep networks to build; PCA handled outside of torch.
         return
+
+    def _init_pert_mapping(self, input_dim: int, kwargs: dict):
+        """
+        Initialize mapping from perturbation inputs to PCA space, optionally
+        concatenating external perturbation features loaded from
+        `perturbation_features_file`.
+        The file is expected to be a torch.load()-able mapping from perturbation key
+        to feature vector, aligned with batch["pert_name"] if provided at training.
+        """
+        pert_feats_file = kwargs.get("perturbation_features_file", None)
+        if pert_feats_file is None:
+            self._pert_feat_dim = 0
+            self.pert_to_pca = nn.Linear(input_dim, self.pca_dim, bias=False)
+            self._pert_external_features = None
+            return
+
+        try:
+            loaded = torch.load(pert_feats_file)
+        except Exception as e:
+            logger.warning(f"Failed to load perturbation features from {pert_feats_file}: {e}")
+            self._pert_feat_dim = 0
+            self.pert_to_pca = nn.Linear(input_dim, self.pca_dim, bias=False)
+            self._pert_external_features = None
+            return
+
+        # Expect a dict-like with string keys
+        if isinstance(loaded, dict):
+            # Convert all vectors to tensors
+            ext = {str(k): (v if isinstance(v, torch.Tensor) else torch.tensor(v)) for k, v in loaded.items()}
+            # Infer feature dim from first entry
+            first_key = next(iter(ext.keys())) if len(ext) > 0 else None
+            feat_dim = int(ext[first_key].numel()) if first_key is not None else 0
+            self._pert_feat_dim = feat_dim
+            self._pert_external_features = ext
+            self.pert_to_pca = nn.Linear(input_dim + feat_dim, self.pca_dim, bias=False)
+            logger.info(f"Loaded perturbation features with dim={feat_dim} from {pert_feats_file}")
+        else:
+            logger.warning(
+                f"Unexpected format in {pert_feats_file}; expected dict mapping to vectors. Proceeding without extra features."
+            )
+            self._pert_feat_dim = 0
+            self._pert_external_features = None
+            self.pert_to_pca = nn.Linear(input_dim, self.pca_dim, bias=False)
+
+    def _init_gene_embeddings(self, kwargs: dict):
+        """
+        Initialize optional gene embeddings for decoding refinement.
+        If `gene_embeddings_path` is provided and loadable via torch.load, we create
+        a projection from PCA delta into gene-embedding space and back to counts.
+        """
+        path = kwargs.get("gene_embeddings_path", None)
+        if path is None:
+            return
+        try:
+            loaded = torch.load(path)
+        except Exception as e:
+            logger.warning(f"Failed to load gene embeddings from {path}: {e}")
+            return
+
+        if isinstance(loaded, dict):
+            # Expect a dict of {gene_name: embedding_tensor}
+            # Build matrix in dataset gene order if `gene_names` are available
+            gene_names = self.hparams.get("gene_names", None)
+            if gene_names is None:
+                # Fallback: try to stack in arbitrary order
+                try:
+                    mat = torch.stack([v if isinstance(v, torch.Tensor) else torch.tensor(v) for v in loaded.values()])
+                except Exception as e:
+                    logger.warning(f"Could not stack gene embeddings: {e}")
+                    return
+            else:
+                rows = []
+                missing = 0
+                for g in gene_names:
+                    vec = loaded.get(str(g), None)
+                    if vec is None:
+                        missing += 1
+                        # If missing, use zeros
+                        if len(rows) == 0:
+                            continue
+                        rows.append(torch.zeros_like(rows[0]))
+                    else:
+                        rows.append(vec if isinstance(vec, torch.Tensor) else torch.tensor(vec))
+                if len(rows) == 0:
+                    logger.warning("Gene embeddings missing or empty; skipping embedding refinement")
+                    return
+                if missing > 0:
+                    logger.info(f"Gene embeddings missing for {missing} genes; filled with zeros")
+                mat = torch.stack(rows, dim=0)
+
+            # Cache on module (moved to device during forward)
+            self._gene_emb_matrix = mat  # [G, E]
+            # A small projection: PCA delta -> gene counts via embeddings
+            self._gene_emb_proj = nn.Linear(self.pca_dim, mat.shape[1], bias=False)
+            self._use_gene_embeddings = True
+            logger.info(f"Loaded gene embeddings with shape {mat.shape} from {path}")
+        else:
+            logger.warning(
+                f"Unexpected gene embeddings format at {path}; expected dict mapping gene->embedding tensor"
+            )
 
     def _ensure_pca(self, ctrl_counts_2d: np.ndarray):
         if not self._pca_fitted:
@@ -136,8 +244,39 @@ class PCALinearPerturbationModel(PerturbationModel):
         z_ctrl = torch.from_numpy(self._pca.transform(flat_ctrl)).to(device)
         z_ctrl = z_ctrl.reshape(B, S, -1)
 
-        # Compute additive effect in PCA space from perturbation embedding
-        z_delta = self.pert_to_pca(pert)
+        # Compute additive effect in PCA space from perturbation embedding (+ optional external features)
+        if self._pert_feat_dim and self._pert_external_features is not None and "pert_name" in batch:
+            # Build feature tensor aligned to batch["pert_name"] (B,S)
+            pert_names = batch["pert_name"]  # list/array-like of strings per element
+            if isinstance(pert_names, (list, tuple)):
+                # Expect flattened alignment; reshape to [B,S]
+                if len(pert_names) == B * S:
+                    pert_names = np.array(pert_names).reshape(B, S)
+                else:
+                    pert_names = np.array(pert_names)
+            # Gather features
+            feat_rows = []
+            for i in range(B):
+                row = []
+                for j in range(S):
+                    key = str(pert_names[i][j]) if pert_names.ndim == 2 else str(pert_names[j])
+                    vec = self._pert_external_features.get(key, None)
+                    if vec is None:
+                        if len(feat_rows) == 0 and len(row) == 0:
+                            # create a zero vector placeholder if needed
+                            zero = torch.zeros(self._pert_feat_dim)
+                        else:
+                            zero = torch.zeros_like(feat_rows[0][0])
+                        row.append(zero)
+                    else:
+                        row.append(vec if isinstance(vec, torch.Tensor) else torch.tensor(vec))
+                feat_rows.append(torch.stack(row, dim=0))
+            ext_feats = torch.stack(feat_rows, dim=0).to(pert.device).to(pert.dtype)
+            pert_input = torch.cat([pert, ext_feats], dim=-1)
+        else:
+            pert_input = pert
+
+        z_delta = self.pert_to_pca(pert_input)
         z_bias = self.pca_intercept.view(1, 1, -1)
 
         if self.batch_intercept is not None and batch_idx is not None:
@@ -152,6 +291,17 @@ class PCALinearPerturbationModel(PerturbationModel):
         flat_z = z_pred.reshape(-1, z_pred.size(-1)).detach().cpu().numpy().astype(np.float32)
         y_hat = self._pca.inverse_transform(flat_z)
         y_hat = torch.from_numpy(y_hat).to(device).reshape(B, S, G)
+
+        # Optional refinement using gene embeddings as a corrective term
+        if self._use_gene_embeddings and self._gene_emb_matrix is not None and self._gene_emb_proj is not None:
+            # Map PCA delta to gene-embedding space, then back to counts via a learned linear comb (through embeddings)
+            ge = self._gene_emb_matrix.to(device)
+            z_delta_flat = z_delta.reshape(-1, z_delta.size(-1))
+            emb_coeffs = self._gene_emb_proj(z_delta_flat)  # [B*S, E]
+            # Project to counts by multiplying by embedding matrix transpose: [B*S, E] @ [E, G]
+            correction = emb_coeffs @ ge.T  # [B*S, G]
+            correction = correction.reshape(B, S, G)
+            y_hat = y_hat + correction
 
         if self.relu is not None:
             y_hat = self.relu(y_hat)
