@@ -6,6 +6,7 @@ import torch
 import torch.nn as nn
 
 from .base import PerturbationModel
+from .utils import build_mlp, get_activation_class
 
 logger = logging.getLogger(__name__)
 
@@ -54,24 +55,31 @@ class LinearMixedPerturbationModel(PerturbationModel):
 
         self.predict_residual = predict_residual
         self.output_space = output_space
-
         # Sequence length hint for reshaping; fall back to dataset config key if provided
         self.cell_sentence_len = int(kwargs.get("cell_set_len", 256))
 
-        # Build simple fixed-effects linear maps (no nonlinearities)
-        # ctrl -> output, pert -> output
-        self.fixed_ctrl = nn.Linear(self.input_dim, self.output_dim, bias=False)
-        self.fixed_pert = nn.Linear(self.pert_dim, self.output_dim, bias=False)
+        # Follow StateTransition template hyperparams
+        self.n_encoder_layers = kwargs.get("n_encoder_layers", 2)
+        self.n_decoder_layers = kwargs.get("n_decoder_layers", 2)
+        self.activation_class = get_activation_class(kwargs.get("activation", "gelu"))
+
+        # Build template-like networks (no transformer)
+        self._build_networks()
 
         # Global intercept
         self.intercept = nn.Parameter(torch.zeros(self.output_dim))
 
-        # Optional random intercept per batch (treated as categorical index)
+        # Optional batch encoders/effects
         self.batch_encoder_enabled = kwargs.get("batch_encoder", False) and batch_dim is not None
         if self.batch_encoder_enabled:
+            # Random intercept in output space
             self.random_intercept = nn.Embedding(num_embeddings=batch_dim, embedding_dim=self.output_dim)
+            # Fixed batch effect in hidden space
+            enc_hidden = self.hidden_dim if self.hidden_dim and self.hidden_dim > 0 else max(64, self.input_dim)
+            self.batch_encoder = nn.Embedding(num_embeddings=batch_dim, embedding_dim=enc_hidden)
         else:
             self.random_intercept = None
+            self.batch_encoder = None
 
         # If the model outputs gene space, ensure non-negativity similar to other models
         is_gene_space = kwargs.get("embed_key") == "X_hvg" or kwargs.get("embed_key") is None
@@ -81,8 +89,34 @@ class LinearMixedPerturbationModel(PerturbationModel):
             self.relu = None
 
     def _build_networks(self):
-        # Nothing to build beyond linear layers for this model
-        return
+        enc_hidden = self.hidden_dim if self.hidden_dim and self.hidden_dim > 0 else max(64, self.input_dim)
+
+        self.pert_encoder = build_mlp(
+            in_dim=self.pert_dim,
+            out_dim=enc_hidden,
+            hidden_dim=enc_hidden,
+            n_layers=self.n_encoder_layers,
+            dropout=self.dropout,
+            activation=self.activation_class,
+        )
+
+        self.basal_encoder = build_mlp(
+            in_dim=self.input_dim,
+            out_dim=enc_hidden,
+            hidden_dim=enc_hidden,
+            n_layers=self.n_encoder_layers,
+            dropout=self.dropout,
+            activation=self.activation_class,
+        )
+
+        self.project_out = build_mlp(
+            in_dim=enc_hidden,
+            out_dim=self.output_dim,
+            hidden_dim=enc_hidden,
+            n_layers=self.n_decoder_layers,
+            dropout=self.dropout,
+            activation=self.activation_class,
+        )
 
     def _extract_batch_indices(self, batch_tensor: torch.Tensor) -> torch.Tensor:
         """
@@ -115,9 +149,26 @@ class LinearMixedPerturbationModel(PerturbationModel):
                 elif batch_idx.dim() == 2:
                     batch_idx = batch_idx.reshape(1, -1, batch_idx.size(-1))
 
-        # Fixed effects (map both to output_dim to ensure shape alignment)
-        ctrl_eff = self.fixed_ctrl(basal)
-        pert_eff = self.fixed_pert(pert)
+        # Encode inputs to hidden space
+        pert_h = self.pert_encoder(pert)
+        basal_h = self.basal_encoder(basal)
+
+        # Optional fixed batch effect in hidden space
+        if self.batch_encoder is not None and batch_idx is not None:
+            if batch_idx.dim() == 3:
+                batch_ids = batch_idx.argmax(-1)
+            else:
+                batch_ids = batch_idx.long()
+            batch_h = self.batch_encoder(batch_ids)
+            hidden_sum = pert_h + basal_h + batch_h
+        else:
+            hidden_sum = pert_h + basal_h
+
+        # Project to output space
+        if self.predict_residual:
+            fixed_out = self.project_out(hidden_sum + basal_h)
+        else:
+            fixed_out = self.project_out(hidden_sum)
 
         # Random intercept
         if self.random_intercept is not None and batch_idx is not None:
@@ -130,13 +181,18 @@ class LinearMixedPerturbationModel(PerturbationModel):
         # Broadcast intercept to [B, S, D]
         intercept = self.intercept.view(1, 1, -1)
 
-        # Ensure rand_eff is broadcastable
-        if isinstance(rand_eff, float):
-            rand_eff_t = 0.0
+        # Random intercept per sequence
+        if self.random_intercept is not None and batch_idx is not None:
+            if batch_idx.dim() == 3:
+                seq_ids = batch_idx.argmax(-1)[:, :1]
+            else:
+                seq_ids = batch_idx[:, :1] if batch_idx.dim() == 2 else batch_idx.reshape(-1, 1)
+            rand_seq = self.random_intercept(seq_ids.long())  # [B,1,D]
+            rand_eff = rand_seq.expand(-1, hidden_sum.size(1), -1)
         else:
-            rand_eff_t = rand_eff
+            rand_eff = 0.0
 
-        y_hat = ctrl_eff + pert_eff + intercept + (rand_eff_t if not isinstance(rand_eff_t, float) else 0.0)
+        y_hat = fixed_out + intercept + (rand_eff if not isinstance(rand_eff, float) else 0.0)
 
         # If output is gene space, apply ReLU to enforce non-negativity
         if self.relu is not None:
