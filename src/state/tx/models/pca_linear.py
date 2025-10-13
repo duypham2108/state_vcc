@@ -1,3 +1,7 @@
+# pyright: reportMissingImports=false
+# pyright: reportOptionalMemberAccess=false
+# pyright: reportIncompatibleMethodOverride=false
+from typing import Dict, Optional
 import logging
 from typing import Dict, Optional
 
@@ -33,21 +37,24 @@ class PCALinearPerturbationModel(PerturbationModel):
     def __init__(
         self,
         input_dim: int,
-        hidden_dim: int,
-        output_dim: int,
-        pert_dim: int,
-        batch_dim: int = None,
+        hidden_dim: int = 0,
+        output_dim: int = 0,
+        pert_dim: int = 0,
+        batch_dim: Optional[int] = None,
         output_space: str = "gene",
         gene_dim: Optional[int] = None,
         **kwargs,
     ):
+        # Ensure an int for base class signature
+        effective_gene_dim = int(gene_dim) if gene_dim is not None else int(input_dim)
+
         super().__init__(
             input_dim=input_dim,
             hidden_dim=hidden_dim,
-            gene_dim=gene_dim,
+            gene_dim=effective_gene_dim,
             output_dim=output_dim,
             pert_dim=pert_dim,
-            batch_dim=batch_dim,
+            batch_dim=batch_dim,  # pyright: ignore[reportArgumentType]
             output_space=output_space,
             **kwargs,
         )
@@ -241,7 +248,9 @@ class PCALinearPerturbationModel(PerturbationModel):
         self._ensure_pca(flat_ctrl)
 
         # Transform control counts to PCA space
-        z_ctrl = torch.from_numpy(self._pca.transform(flat_ctrl)).to(device)
+        pca = self._pca
+        assert pca is not None
+        z_ctrl = torch.from_numpy(pca.transform(flat_ctrl)).to(device)
         z_ctrl = z_ctrl.reshape(B, S, -1)
 
         # Compute additive effect in PCA space from perturbation embedding (+ optional external features)
@@ -289,7 +298,9 @@ class PCALinearPerturbationModel(PerturbationModel):
 
         # Decode to gene space via inverse transform
         flat_z = z_pred.reshape(-1, z_pred.size(-1)).detach().cpu().numpy().astype(np.float32)
-        y_hat = self._pca.inverse_transform(flat_z)
+        pca = self._pca
+        assert pca is not None
+        y_hat = pca.inverse_transform(flat_z)
         y_hat = torch.from_numpy(y_hat).to(device).reshape(B, S, G)
 
         # Optional refinement using gene embeddings as a corrective term
@@ -326,13 +337,13 @@ class PCALinearPerturbationModel(PerturbationModel):
         self.log("train_loss", loss)
         return loss
 
-    def validation_step(self, batch: Dict[str, torch.Tensor], batch_idx: int) -> Dict[str, torch.Tensor]:
+    def validation_step(self, batch: Dict[str, torch.Tensor], batch_idx: int) -> None:
         pred = self.forward(batch)
         target = batch["pert_cell_counts"].reshape(-1, self.cell_sentence_len, self.gene_dim)
         pred = pred.reshape(-1, self.cell_sentence_len, self.gene_dim)
         loss = self.loss_fn(pred, target).mean()
         self.log("val_loss", loss)
-        return {"loss": loss, "predictions": pred}
+        return None
 
     def test_step(self, batch: Dict[str, torch.Tensor], batch_idx: int) -> None:
         pred = self.forward(batch, padded=False)
