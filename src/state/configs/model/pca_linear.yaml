@@ -1,4 +1,4 @@
-name: PCALinear
+name: pca_linear
 checkpoint: null
 device: cuda
 

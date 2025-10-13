@@ -1,4 +1,4 @@
-name: LinearMixed
+name: lmm
 checkpoint: null
 device: cuda
 
