@@ -9,6 +9,7 @@ from .base import PerturbationModel
 logger = logging.getLogger(__name__)
 
 
+# pyright: reportIncompatibleMethodOverride=false
 class LinearMixedPerturbationModel(PerturbationModel):
     """
     A basic linear mixed-effects style model implemented with torch.
@@ -29,22 +30,23 @@ class LinearMixedPerturbationModel(PerturbationModel):
     def __init__(
         self,
         input_dim: int,
-        hidden_dim: int,
-        output_dim: int,
-        pert_dim: int,
-        batch_dim: int = None,
+        hidden_dim: int = 0,
+        output_dim: int = 0,
+        pert_dim: int = 0,
+        batch_dim: Optional[int] = None,
         predict_residual: bool = True,
         output_space: str = "gene",
         gene_dim: Optional[int] = None,
         **kwargs,
     ):
+        effective_gene_dim = int(gene_dim) if gene_dim is not None else int(input_dim)
         super().__init__(
             input_dim=input_dim,
             hidden_dim=hidden_dim,
-            gene_dim=gene_dim,
+            gene_dim=effective_gene_dim,
             output_dim=output_dim,
             pert_dim=pert_dim,
-            batch_dim=batch_dim,
+            batch_dim=batch_dim,  # pyright: ignore[reportArgumentType]
             output_space=output_space,
             **kwargs,
         )
