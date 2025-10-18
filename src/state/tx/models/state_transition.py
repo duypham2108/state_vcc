@@ -322,11 +322,45 @@ class StateTransitionPerturbationModel(PerturbationModel):
             )
         print(self)
 
-        # Diffusion removed in light cross-attention implementation
+        # --- Diffusion configuration ---
+        self.diffusion_cfg = kwargs.get("diffusion", {}) or {}
+        self._diff_enable = bool(self.diffusion_cfg.get("enable", False))
+        if self._diff_enable:
+            # Schedules
+            num_steps = int(self.diffusion_cfg.get("num_steps", 50))
+            beta_schedule = str(self.diffusion_cfg.get("beta_schedule", "cosine")).lower()
+            betas = self._make_beta_schedule(beta_schedule, num_steps)
+            alphas = 1.0 - betas
+            alpha_bars = torch.cumprod(alphas, dim=0)
+            self.register_buffer("_diff_betas", betas, persistent=False)
+            self.register_buffer("_diff_alpha_bars", alpha_bars, persistent=False)
+
+            # Modules
+            time_embed_dim = int(self.diffusion_cfg.get("time_embed_dim", 128))
+            bottleneck_dim = int(self.diffusion_cfg.get("bottleneck_dim", self.hidden_dim))
+            eps_hidden_dim = int(self.diffusion_cfg.get("eps_hidden_dim", self.hidden_dim))
+            eps_n_layers = int(self.diffusion_cfg.get("eps_n_layers", 2))
+
+            self._diff_time_mlp = nn.Sequential(
+                nn.Linear(1, time_embed_dim),
+                nn.SiLU(),
+                nn.Linear(time_embed_dim, time_embed_dim),
+            )
+            # Condition on model prediction (latent) via projection
+            self._diff_cond_proj = nn.Linear(self.output_dim, bottleneck_dim)
+            self._diff_eps = build_mlp(
+                in_dim=self.output_dim + time_embed_dim + bottleneck_dim,
+                out_dim=self.output_dim,
+                hidden_dim=eps_hidden_dim,
+                n_layers=eps_n_layers,
+                dropout=self.dropout,
+                activation=self.activation_class,
+            )
+            self._diff_loss_weight = float(self.diffusion_cfg.get("loss_weight", 1.0))
 
     def _build_networks(self, lora_cfg=None):
         """
-        Build lightweight linear cross-attention model.
+        Build self-attention encoder model.
         """
         self.pert_encoder = build_mlp(
             in_dim=self.pert_dim,
@@ -350,15 +384,28 @@ class StateTransitionPerturbationModel(PerturbationModel):
         else:
             self.basal_encoder = nn.Linear(self.input_dim, self.hidden_dim)
 
-        # Single-layer light cross-attention: queries from perturbation, keys/values from control
+        # Transformer encoder (self-attention across the sequence)
         attn_heads = int(self.hparams.get("attn_heads", 4)) if hasattr(self, "hparams") else int(lora_cfg.get("attn_heads", 4) if lora_cfg else 4)
-        self.cross_attn = nn.MultiheadAttention(
-            embed_dim=self.hidden_dim,
-            num_heads=attn_heads,
+        n_layers = None
+        if hasattr(self, "hparams") and "transformer_backbone_kwargs" in getattr(self, "hparams", {}):
+            try:
+                n_layers = int(self.hparams["transformer_backbone_kwargs"].get("n_layer", None))
+            except Exception:
+                n_layers = None
+        if n_layers is None:
+            n_layers = int((self.transformer_backbone_kwargs or {}).get("n_layer", 4))
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=self.hidden_dim,
+            nhead=attn_heads,
+            dim_feedforward=max(4 * self.hidden_dim, 256),
             dropout=self.dropout,
             batch_first=True,
+            activation="gelu",
+            norm_first=False,
         )
-        self.cross_attn_out = nn.Linear(self.hidden_dim, self.hidden_dim)
+        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+        self.encoder_norm = nn.LayerNorm(self.hidden_dim)
 
         # Project from input_dim to hidden_dim for transformer input
         # self.project_to_hidden = nn.Linear(self.input_dim, self.hidden_dim)
@@ -379,7 +426,18 @@ class StateTransitionPerturbationModel(PerturbationModel):
                 nn.Linear(self.output_dim // 8, self.output_dim),
             )
 
-    # Diffusion helper methods removed
+    def _make_beta_schedule(self, schedule: str, num_steps: int) -> torch.Tensor:
+        schedule = schedule.lower()
+        if schedule == "linear":
+            return torch.linspace(1e-4, 0.02, num_steps)
+        # cosine schedule per Nichol & Dhariwal
+        steps = num_steps
+        s = 0.008
+        x = torch.linspace(0, steps, steps + 1)
+        alphas_cumprod = torch.cos(((x / steps) + s) / (1 + s) * torch.pi * 0.5) ** 2
+        alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
+        betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
+        return betas.clamp(1e-5, 0.999)
 
     def encode_perturbation(self, pert: torch.Tensor) -> torch.Tensor:
         """If needed, define how we embed the raw perturbation input."""
@@ -447,16 +505,23 @@ class StateTransitionPerturbationModel(PerturbationModel):
             # Append confidence token: [B, S, E] -> [B, S+1, E] (might be one more if we have the batch token)
             seq_input = self.confidence_token.append_confidence_token(seq_input)
 
-        # forward pass + extract CLS last hidden state
-        # Light cross-attention (queries: pert; keys/values: control)
-        attn_output, _ = self.cross_attn(query=pert_embedding, key=control_cells, value=control_cells)
-        # Optional linear projection after attention
-        transformer_output = self.cross_attn_out(attn_output)
+        # Self-attention encoder
+        transformer_output = self.transformer_encoder(seq_input)
+        transformer_output = self.encoder_norm(transformer_output)
 
-        # Extract outputs accounting for optional prepended batch token and optional confidence token at the end
-        # No special tokens used in light cross-attention path
-        res_pred = transformer_output
-        self._batch_token_cache = None
+        # Manage special tokens
+        confidence_pred = None
+        main_output = transformer_output
+        if self.confidence_token is not None:
+            main_output, confidence_pred = self.confidence_token.extract_confidence_prediction(transformer_output)
+        if self.use_batch_token and self.batch_token is not None:
+            # Cache first token for auxiliary classification and strip it from main output
+            self._batch_token_cache = main_output[:, :1, :]
+            main_output = main_output[:, 1:, :]
+        else:
+            self._batch_token_cache = None
+
+        res_pred = main_output
 
         # add to basal if predicting residual
         if self.predict_residual and self.output_space == "all":
@@ -581,15 +646,25 @@ class StateTransitionPerturbationModel(PerturbationModel):
 
             # If using cross-attention decoder, feed hidden states instead of output_dim
             if getattr(self, "gene_decoder_uses_hidden", False):
-                # Recompute hidden states with current batch using light cross-attention
+                # Recompute hidden states with current batch using self-attention encoder
                 S = self.cell_sentence_len if padded else batch["pert_emb"].shape[0]
                 pert = batch["pert_emb"].reshape(-1, S, self.pert_dim if padded else batch["pert_emb"].shape[-1])
                 basal = batch["ctrl_cell_emb"].reshape(-1, S, self.input_dim if padded else batch["ctrl_cell_emb"].shape[-1])
                 pert_embedding = self.encode_perturbation(pert)
                 control_cells = self.encode_basal_expression(basal)
-                res_hidden, _ = self.cross_attn(query=pert_embedding, key=control_cells, value=control_cells)
-                res_hidden = self.cross_attn_out(res_hidden)
-                latent_preds = res_hidden
+                seq_input_hidden = pert_embedding + control_cells
+                if self.use_batch_token and self.batch_token is not None:
+                    B = seq_input_hidden.size(0)
+                    seq_input_hidden = torch.cat([self.batch_token.expand(B, -1, -1), seq_input_hidden], dim=1)
+                if self.confidence_token is not None:
+                    seq_input_hidden = self.confidence_token.append_confidence_token(seq_input_hidden)
+                hidden_out = self.transformer_encoder(seq_input_hidden)
+                hidden_out = self.encoder_norm(hidden_out)
+                if self.confidence_token is not None:
+                    hidden_out, _ = self.confidence_token.extract_confidence_prediction(hidden_out)
+                if self.use_batch_token and self.batch_token is not None:
+                    hidden_out = hidden_out[:, 1:, :]
+                latent_preds = hidden_out
 
             if isinstance(self.gene_decoder, NBDecoder):
                 mu, theta = self.gene_decoder(latent_preds)
@@ -609,7 +684,32 @@ class StateTransitionPerturbationModel(PerturbationModel):
 
             total_loss = total_loss + self.decoder_loss_weight * decoder_loss
 
-        # Diffusion removed
+        # Optional diffusion loss on latent targets, conditioned on model prediction
+        if self._diff_enable:
+            if padded:
+                pred_seq = pred.reshape(-1, self.cell_sentence_len, self.output_dim)
+                target_seq = target.reshape(-1, self.cell_sentence_len, self.output_dim)
+            else:
+                pred_seq = pred.reshape(1, -1, self.output_dim)
+                target_seq = target.reshape(1, -1, self.output_dim)
+
+            B, S, D = target_seq.shape
+            device = target_seq.device
+            T = self._diff_alpha_bars.shape[0]
+            t = torch.randint(0, T, (B, 1, 1), device=device)
+            alpha_bar_t = self._diff_alpha_bars[t]
+            noise = torch.randn_like(target_seq)
+            noisy_x = alpha_bar_t.sqrt() * target_seq + (1 - alpha_bar_t).sqrt() * noise
+
+            # Time embedding and conditioning
+            t_scaled = (t.float() / max(T - 1, 1)).reshape(B * S, 1)
+            time_feat = self._diff_time_mlp(t_scaled).reshape(B, S, -1)
+            cond_feat = self._diff_cond_proj(pred_seq)
+            eps_in = torch.cat([noisy_x, time_feat, cond_feat], dim=-1)
+            eps_pred = self._diff_eps(eps_in)
+            diff_loss = F.mse_loss(eps_pred, noise, reduction="mean")
+            self.log("train/diffusion_loss", diff_loss)
+            total_loss = total_loss + self._diff_loss_weight * diff_loss
 
         if confidence_pred is not None and self.confidence_loss_fn is not None:
             # Detach main loss to prevent gradients flowing through it
