@@ -702,8 +702,9 @@ class StateTransitionPerturbationModel(PerturbationModel):
             noisy_x = alpha_bar_t.sqrt() * target_seq + (1 - alpha_bar_t).sqrt() * noise
 
             # Time embedding and conditioning
-            t_scaled = (t.float() / max(T - 1, 1)).reshape(B * S, 1)
-            time_feat = self._diff_time_mlp(t_scaled).reshape(B, S, -1)
+            t_scaled = t.float() / max(T - 1, 1)  # shape [B,1,1]
+            time_feat_seq = self._diff_time_mlp(t_scaled)  # [B,1,time_embed_dim]
+            time_feat = time_feat_seq.expand(B, S, -1)  # [B,S,time_embed_dim]
             cond_feat = self._diff_cond_proj(pred_seq)
             eps_in = torch.cat([noisy_x, time_feat, cond_feat], dim=-1)
             eps_pred = self._diff_eps(eps_in)
