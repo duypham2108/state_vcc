@@ -89,15 +89,7 @@ output_dir="$HOME/state" \
 name="test"
 ```
 
-To enable the optional diffusion auxiliary loss during training, add the following override:
-
-```bash
-state tx train \
-  model.kwargs.diffusion.enable=true \
-  model.kwargs.diffusion.num_steps=50 \
-  model.kwargs.diffusion.beta_schedule=cosine \
-  ...
-```
+ 
 
 The cell lines and perturbations specified in the TOML should match the values appearing in the
 `data.kwargs.cell_type_key` and `data.kwargs.pert_col` used above. To evaluate STATE on the specified task,

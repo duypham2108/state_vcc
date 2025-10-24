@@ -44,15 +44,8 @@ kwargs:
       dropout: 0.1
       freeze_embeddings: true
       gene_embeddings_path: null
-  # Optional diffusion on latent outputs
-  diffusion:
+  # Optional CatBoost decoder for counts prediction (non-differentiable)
+  catboost_decoder:
       enable: false
-      num_steps: 50
-      beta_schedule: cosine # linear|cosine
-      time_embed_dim: 128
-      loss_weight: 1.0
-      # parameter size controls
-      factorized: true
-      bottleneck_dim: 512
-      eps_hidden_dim: 512
-      eps_n_layers: 2
+      model_path: null  # path to CatBoostRegressor model file (.cbm)
+      target_dim: ${model.kwargs.gene_dim}

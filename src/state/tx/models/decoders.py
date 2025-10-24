@@ -1,4 +1,6 @@
+# pyright: reportMissingImports=false, reportUnknownMemberType=false, reportAttributeAccessIssue=false
 import logging
+import numpy as np
 
 import torch
 import torch.nn as nn
@@ -216,3 +218,59 @@ class GeneCrossAttentionDecoder(nn.Module):
         S = cell_latents.size(1)
         logits = logits.unsqueeze(1).expand(B, S, -1)  # [B, S, G]
         return logits
+
+
+class CatBoostDecoder(nn.Module):
+    """
+    Wrap a pretrained CatBoostRegressor to map latent features to gene-space outputs.
+
+    Notes:
+    - This decoder is non-differentiable and is intended for inference or as a fixed head.
+    - If used during training, gradients will not flow through this module.
+    """
+
+    def __init__(self, *, model_path: str, target_dim: int):
+        super().__init__()
+        try:
+            from catboost import CatBoostRegressor  # type: ignore
+        except Exception as exc:  # pragma: no cover - optional dependency
+            raise ImportError(
+                "catboost is not installed. Install it with: pip install catboost"
+            ) from exc
+
+        self._cb = CatBoostRegressor()
+        self._cb.load_model(model_path)
+        self._target_dim = int(target_dim)
+
+    def gene_dim(self) -> int:
+        return self._target_dim
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:  # [B, S, D] or [N, D]
+        with torch.no_grad():
+            if x.dim() == 2:
+                x2d = x
+                shape = None
+            elif x.dim() == 3:
+                B, S, D = x.shape
+                x2d = x.reshape(B * S, D)
+                shape = (B, S)
+            else:
+                raise ValueError(f"Expected input of shape [N,D] or [B,S,D], got {tuple(x.shape)}")
+
+            preds = self._cb.predict(x2d.detach().cpu().numpy())
+            preds = np.asarray(preds, dtype=np.float32)
+            if preds.ndim == 1:
+                preds = preds[:, None]
+            if preds.shape[-1] != self._target_dim:
+                # If CatBoost was trained for single-output, tile or raise
+                if preds.shape[-1] == 1 and self._target_dim > 1:
+                    preds = np.tile(preds, (1, self._target_dim))
+                else:
+                    raise ValueError(
+                        f"CatBoost predictions last dim {preds.shape[-1]} != target_dim {self._target_dim}"
+                    )
+
+            if shape is not None:
+                preds = preds.reshape(shape[0], shape[1], self._target_dim)
+
+            return torch.from_numpy(preds).to(x.device)

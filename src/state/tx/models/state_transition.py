@@ -12,7 +12,7 @@ from geomloss import SamplesLoss
 from typing import Tuple
 
 from .base import PerturbationModel
-from .decoders import FinetuneVCICountsDecoder, GeneCrossAttentionDecoder
+from .decoders import FinetuneVCICountsDecoder, GeneCrossAttentionDecoder, CatBoostDecoder
 from .decoders_nb import NBDecoder, nb_nll
 from .utils import build_mlp, get_activation_class
 
@@ -205,6 +205,17 @@ class StateTransitionPerturbationModel(PerturbationModel):
             )
             self.gene_decoder_uses_hidden = True
 
+        # Optional: CatBoost decoder (non-differentiable, inference-oriented)
+        catboost_cfg = kwargs.get("catboost_decoder", None)
+        if catboost_cfg and catboost_cfg.get("enable", False):
+            model_path = catboost_cfg.get("model_path", None)
+            if not model_path:
+                raise ValueError("catboost_decoder.enable=True requires 'model_path'")
+            # Use gene_dim as default prediction dimension
+            target_dim = int(catboost_cfg.get("target_dim", effective_gene_dim))
+            self.gene_decoder = CatBoostDecoder(model_path=model_path, target_dim=target_dim)
+            self.gene_decoder_uses_hidden = False
+
         # Add an optional encoder that introduces a batch variable
         self.batch_encoder = None
         self.batch_dim = None
@@ -322,42 +333,6 @@ class StateTransitionPerturbationModel(PerturbationModel):
             )
         print(self)
 
-        # --- Diffusion configuration ---
-        self.diffusion_cfg = kwargs.get("diffusion", {}) or {}
-        self._diff_enable = bool(self.diffusion_cfg.get("enable", False))
-        if self._diff_enable:
-            # Schedules
-            num_steps = int(self.diffusion_cfg.get("num_steps", 50))
-            beta_schedule = str(self.diffusion_cfg.get("beta_schedule", "cosine")).lower()
-            betas = self._make_beta_schedule(beta_schedule, num_steps)
-            alphas = 1.0 - betas
-            alpha_bars = torch.cumprod(alphas, dim=0)
-            self.register_buffer("_diff_betas", betas, persistent=False)
-            self.register_buffer("_diff_alpha_bars", alpha_bars, persistent=False)
-
-            # Modules
-            time_embed_dim = int(self.diffusion_cfg.get("time_embed_dim", 128))
-            bottleneck_dim = int(self.diffusion_cfg.get("bottleneck_dim", self.hidden_dim))
-            eps_hidden_dim = int(self.diffusion_cfg.get("eps_hidden_dim", self.hidden_dim))
-            eps_n_layers = int(self.diffusion_cfg.get("eps_n_layers", 2))
-
-            self._diff_time_mlp = nn.Sequential(
-                nn.Linear(1, time_embed_dim),
-                nn.SiLU(),
-                nn.Linear(time_embed_dim, time_embed_dim),
-            )
-            # Condition on model prediction (latent) via projection
-            self._diff_cond_proj = nn.Linear(self.output_dim, bottleneck_dim)
-            self._diff_eps = build_mlp(
-                in_dim=self.output_dim + time_embed_dim + bottleneck_dim,
-                out_dim=self.output_dim,
-                hidden_dim=eps_hidden_dim,
-                n_layers=eps_n_layers,
-                dropout=self.dropout,
-                activation=self.activation_class,
-            )
-            self._diff_loss_weight = float(self.diffusion_cfg.get("loss_weight", 1.0))
-
     def _build_networks(self, lora_cfg=None):
         """
         Build self-attention encoder model.
@@ -426,18 +401,7 @@ class StateTransitionPerturbationModel(PerturbationModel):
                 nn.Linear(self.output_dim // 8, self.output_dim),
             )
 
-    def _make_beta_schedule(self, schedule: str, num_steps: int) -> torch.Tensor:
-        schedule = schedule.lower()
-        if schedule == "linear":
-            return torch.linspace(1e-4, 0.02, num_steps)
-        # cosine schedule per Nichol & Dhariwal
-        steps = num_steps
-        s = 0.008
-        x = torch.linspace(0, steps, steps + 1)
-        alphas_cumprod = torch.cos(((x / steps) + s) / (1 + s) * torch.pi * 0.5) ** 2
-        alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
-        betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
-        return betas.clamp(1e-5, 0.999)
+    
 
     def encode_perturbation(self, pert: torch.Tensor) -> torch.Tensor:
         """If needed, define how we embed the raw perturbation input."""
@@ -670,6 +634,14 @@ class StateTransitionPerturbationModel(PerturbationModel):
                 mu, theta = self.gene_decoder(latent_preds)
                 gene_targets = batch["pert_cell_counts"].reshape_as(mu)
                 decoder_loss = nb_nll(gene_targets, mu, theta)
+            elif isinstance(self.gene_decoder, CatBoostDecoder):
+                with torch.no_grad():
+                    pert_cell_counts_preds = self.gene_decoder(latent_preds)
+                if padded:
+                    gene_targets = gene_targets.reshape(-1, self.cell_sentence_len, self.gene_decoder.gene_dim())
+                else:
+                    gene_targets = gene_targets.reshape(1, -1, self.gene_decoder.gene_dim())
+                decoder_loss = self.loss_fn(pert_cell_counts_preds, gene_targets).mean()
             else:
                 pert_cell_counts_preds = self.gene_decoder(latent_preds)
                 if padded:
@@ -681,36 +653,11 @@ class StateTransitionPerturbationModel(PerturbationModel):
 
             # Log decoder loss
             self.log("decoder_loss", decoder_loss)
+            # Do not backprop through CatBoost decoder (non-differentiable)
+            if not isinstance(self.gene_decoder, CatBoostDecoder):
+                total_loss = total_loss + self.decoder_loss_weight * decoder_loss
 
-            total_loss = total_loss + self.decoder_loss_weight * decoder_loss
-
-        # Optional diffusion loss on latent targets, conditioned on model prediction
-        if self._diff_enable:
-            if padded:
-                pred_seq = pred.reshape(-1, self.cell_sentence_len, self.output_dim)
-                target_seq = target.reshape(-1, self.cell_sentence_len, self.output_dim)
-            else:
-                pred_seq = pred.reshape(1, -1, self.output_dim)
-                target_seq = target.reshape(1, -1, self.output_dim)
-
-            B, S, D = target_seq.shape
-            device = target_seq.device
-            T = self._diff_alpha_bars.shape[0]
-            t = torch.randint(0, T, (B, 1, 1), device=device)
-            alpha_bar_t = self._diff_alpha_bars[t]
-            noise = torch.randn_like(target_seq)
-            noisy_x = alpha_bar_t.sqrt() * target_seq + (1 - alpha_bar_t).sqrt() * noise
-
-            # Time embedding and conditioning
-            t_scaled = t.float() / max(T - 1, 1)  # shape [B,1,1]
-            time_feat_seq = self._diff_time_mlp(t_scaled)  # [B,1,time_embed_dim]
-            time_feat = time_feat_seq.expand(B, S, -1)  # [B,S,time_embed_dim]
-            cond_feat = self._diff_cond_proj(pred_seq)
-            eps_in = torch.cat([noisy_x, time_feat, cond_feat], dim=-1)
-            eps_pred = self._diff_eps(eps_in)
-            diff_loss = F.mse_loss(eps_pred, noise, reduction="mean")
-            self.log("train/diffusion_loss", diff_loss)
-            total_loss = total_loss + self._diff_loss_weight * diff_loss
+        
 
         if confidence_pred is not None and self.confidence_loss_fn is not None:
             # Detach main loss to prevent gradients flowing through it
@@ -781,6 +728,13 @@ class StateTransitionPerturbationModel(PerturbationModel):
                 mu, theta = self.gene_decoder(latent_preds)
                 gene_targets = batch["pert_cell_counts"].reshape_as(mu)
                 decoder_loss = nb_nll(gene_targets, mu, theta)
+            elif isinstance(self.gene_decoder, CatBoostDecoder):
+                with torch.no_grad():
+                    pert_cell_counts_preds = self.gene_decoder(latent_preds).reshape(
+                        -1, self.cell_sentence_len, self.gene_decoder.gene_dim()
+                    )
+                gene_targets = gene_targets.reshape(-1, self.cell_sentence_len, self.gene_decoder.gene_dim())
+                decoder_loss = self.loss_fn(pert_cell_counts_preds, gene_targets).mean()
             else:
                 # Get decoder predictions
                 pert_cell_counts_preds = self.gene_decoder(latent_preds).reshape(
@@ -791,7 +745,8 @@ class StateTransitionPerturbationModel(PerturbationModel):
 
             # Log the validation metric
             self.log("val/decoder_loss", decoder_loss)
-            loss = loss + self.decoder_loss_weight * decoder_loss
+            if not isinstance(self.gene_decoder, CatBoostDecoder):
+                loss = loss + self.decoder_loss_weight * decoder_loss
 
         if confidence_pred is not None and self.confidence_loss_fn is not None:
             # Detach main loss to prevent gradients flowing through it
