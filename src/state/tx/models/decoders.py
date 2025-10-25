@@ -1,10 +1,12 @@
 # pyright: reportMissingImports=false, reportUnknownMemberType=false, reportAttributeAccessIssue=false
 import logging
+import math
 import numpy as np
 
 import torch
 import torch.nn as nn
-from typing import Optional, Dict, List, Any
+import torch.nn.functional as F
+from typing import Optional, Dict, List, Any, cast
 from omegaconf import OmegaConf
 
 from ...emb.finetune_decoder import Finetune
@@ -59,7 +61,8 @@ class FinetuneVCICountsDecoder(nn.Module):
             nn.Linear(128, len(self.genes)),
         )
 
-        self.binary_decoder = self.finetune.model.binary_decoder
+        self._finetune_model: Any = self.finetune.model
+        self.binary_decoder = cast(nn.Module, getattr(self._finetune_model, "binary_decoder"))
         for param in self.binary_decoder.parameters():
             param.requires_grad = False
 
@@ -77,7 +80,8 @@ class FinetuneVCICountsDecoder(nn.Module):
         gene_embeds = self.finetune.get_gene_embedding(self.genes)
 
         # Handle RDA task counts
-        use_rda = getattr(self.finetune.model.cfg.model, "rda", False)
+        cfg = getattr(self._finetune_model, "cfg", None)
+        use_rda = bool(getattr(getattr(cfg, "model", None), "rda", False))
         # Define your sub-batch size (tweak this based on your available memory)
         sub_batch_size = 16
         logprob_chunks = []  # to store outputs of each sub-batch
@@ -96,7 +100,10 @@ class FinetuneVCICountsDecoder(nn.Module):
                 task_counts_sub = None
 
             # Compute merged embeddings for the sub-batch
-            merged_embs_sub = self.finetune.model.resize_batch(x_sub, gene_embeds, task_counts_sub)
+            resize_batch = getattr(self._finetune_model, "resize_batch", None)
+            if resize_batch is None:
+                raise AttributeError("Finetune model does not implement resize_batch")
+            merged_embs_sub = resize_batch(x_sub, gene_embeds, task_counts_sub)
 
             # Run the binary decoder on the sub-batch
             logprobs_sub = self.binary_decoder(merged_embs_sub)
@@ -181,6 +188,8 @@ class GeneCrossAttentionDecoder(nn.Module):
             emb_list.append(vec.float())
 
         gene_matrix = torch.stack(emb_list, dim=0)  # [G, D]
+        # Normalize raw embeddings for stable dot-product ranges
+        gene_matrix = F.normalize(gene_matrix, dim=-1)
 
         self._freeze_embeddings = freeze_embeddings
         if freeze_embeddings:
@@ -191,9 +200,22 @@ class GeneCrossAttentionDecoder(nn.Module):
             self._use_param = True
 
         in_dim = gene_matrix.shape[1]
-        self.project_gene = nn.Linear(in_dim, hidden_dim)
-        self.attn = nn.MultiheadAttention(embed_dim=hidden_dim, num_heads=num_heads, dropout=dropout, batch_first=True)
-        self.out = nn.Linear(hidden_dim, 1)
+        # Project genes and cells into a common space; use bias=False as biases do not help in pure similarity scoring
+        self.gene_key = nn.Linear(in_dim, hidden_dim, bias=False)
+        self.cell_proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        # Per-gene bias for calibration
+        self.gene_bias = nn.Parameter(torch.zeros(len(self.genes)))
+        # Temperature scaling for logits and attention scale like Transformer
+        self.scale = 1.0 / math.sqrt(hidden_dim)
+
+        # Cache for projected gene keys if embeddings are frozen
+        if self._freeze_embeddings:
+            with torch.no_grad():
+                keys = self.gene_key(self._gene_embeddings_tensor())  # [G, H]
+                keys = F.normalize(keys, dim=-1)
+            self.register_buffer("_cached_gene_keys", keys)
+        else:
+            self._cached_gene_keys = None  # type: ignore[attr-defined]
 
     def gene_dim(self) -> int:
         return len(self.genes)
@@ -207,16 +229,26 @@ class GeneCrossAttentionDecoder(nn.Module):
     def forward(self, cell_latents: torch.Tensor) -> torch.Tensor:
         # cell_latents: [B, S, H]
         B = cell_latents.size(0)
-        gene_emb = self._gene_embeddings_tensor()
-
-        gene_q = self.project_gene(gene_emb)  # [G, H]
-        gene_q = gene_q.unsqueeze(0).expand(B, -1, -1)  # [B, G, H]
-
-        attn_out, _ = self.attn(query=gene_q, key=cell_latents, value=cell_latents)
-        logits = self.out(attn_out).squeeze(-1)  # [B, G]
-
         S = cell_latents.size(1)
-        logits = logits.unsqueeze(1).expand(B, S, -1)  # [B, S, G]
+
+        # Project cells and normalize
+        Q = self.cell_proj(cell_latents)                   # [B, S, H]
+        Q = F.normalize(Q, dim=-1)
+
+        # Get or compute gene keys
+        if self._freeze_embeddings and hasattr(self, "_cached_gene_keys") and self._cached_gene_keys is not None:
+            K = self._cached_gene_keys  # [G, H]
+        else:
+            gene_emb = self._gene_embeddings_tensor()      # [G, D]
+            K = self.gene_key(gene_emb)                    # [G, H]
+            K = F.normalize(K, dim=-1)
+
+        # Similarity scores per cell and gene
+        logits = torch.einsum("bsh,gh->bsg", Q, K) * self.scale  # [B, S, G]
+
+        # Add per-gene bias
+        logits = logits + self.gene_bias.view(1, 1, -1)
+
         return logits
 
 

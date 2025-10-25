@@ -171,16 +171,14 @@ class StateTransitionPerturbationModel(PerturbationModel):
         # Build the distributional loss from geomloss
         blur = kwargs.get("blur", 0.05)
         loss_name = kwargs.get("loss", "energy")
-        if loss_name == "energy":
-            self.loss_fn = SamplesLoss(loss=self.distributional_loss, blur=blur)
+        if loss_name in ("energy", "sinkhorn"):
+            self.loss_fn = SamplesLoss(loss=loss_name, blur=blur)
         elif loss_name == "mse":
             self.loss_fn = nn.MSELoss()
         elif loss_name == "se":
             sinkhorn_weight = kwargs.get("sinkhorn_weight", 0.01)  # 1/100 = 0.01
             energy_weight = kwargs.get("energy_weight", 1.0)
             self.loss_fn = CombinedLoss(sinkhorn_weight=sinkhorn_weight, energy_weight=energy_weight, blur=blur)
-        elif loss_name == "sinkhorn":
-            self.loss_fn = SamplesLoss(loss="sinkhorn", blur=blur)
         else:
             raise ValueError(f"Unknown loss function: {loss_name}")
 
@@ -229,8 +227,7 @@ class StateTransitionPerturbationModel(PerturbationModel):
 
         # if the model is outputting to counts space, apply relu
         # otherwise its in embedding space and we don't want to
-        is_gene_space = kwargs["embed_key"] == "X_hvg" or kwargs["embed_key"] is None
-        if is_gene_space or self.gene_decoder is None:
+        if self._is_gene_space() or self.gene_decoder is None:
             self.relu = torch.nn.ReLU()
 
         self.use_batch_token = kwargs.get("use_batch_token", False)
@@ -331,7 +328,31 @@ class StateTransitionPerturbationModel(PerturbationModel):
                 genes=gene_names,
                 # latent_dim=self.output_dim + (self.batch_dim or 0),
             )
-        print(self)
+        
+        # FiLM fusion layers for conditioning control cells by perturbation
+        self.film_gamma = nn.Linear(self.hidden_dim, self.hidden_dim)
+        self.film_beta = nn.Linear(self.hidden_dim, self.hidden_dim)
+
+        # Learned positional encoding for sequence tokens (allowing up to +2 special tokens)
+        class LearnedPositionalEncoding(nn.Module):
+            def __init__(self, max_len: int, dim: int):
+                super().__init__()
+                self.pe = nn.Parameter(torch.zeros(1, max_len, dim))
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                return x + self.pe[:, : x.size(1), :]
+
+        max_tokens = int(self.cell_sentence_len) + 2  # batch token + confidence token
+        self.pos_enc = LearnedPositionalEncoding(max_tokens, self.hidden_dim)
+
+    def _is_gene_space(self) -> bool:
+        """Return True if the model outputs to HVG gene space (counts space)."""
+        embed_key = getattr(self, "embed_key", None)
+        try:
+            if hasattr(self, "hparams") and isinstance(self.hparams, dict):
+                embed_key = self.hparams.get("embed_key", embed_key)
+        except Exception:
+            pass
+        return embed_key == "X_hvg" or embed_key is None
 
     def _build_networks(self, lora_cfg=None):
         """
@@ -411,7 +432,7 @@ class StateTransitionPerturbationModel(PerturbationModel):
         """Define how we embed basal state input, if needed."""
         return self.basal_encoder(expr)
 
-    def forward(self, batch: dict, padded=True) -> torch.Tensor:
+    def forward(self, batch: dict, padded=True, return_hidden: bool = False) -> torch.Tensor:
         """
         The main forward call. Batch is a flattened sequence of cell sentences,
         which we reshape into sequences of length cell_sentence_len.
@@ -436,9 +457,10 @@ class StateTransitionPerturbationModel(PerturbationModel):
         pert_embedding = self.encode_perturbation(pert)
         control_cells = self.encode_basal_expression(basal)
 
-        # Add encodings in input_dim space, then project to hidden_dim
-        combined_input = pert_embedding + control_cells  # Shape: [B, S, hidden_dim]
-        seq_input = combined_input  # Shape: [B, S, hidden_dim]
+        # FiLM fusion: scale and shift control cells conditioned on perturbation
+        gamma = self.film_gamma(pert_embedding)
+        beta = self.film_beta(pert_embedding)
+        seq_input = gamma * control_cells + beta  # [B, S, H]
 
         if self.batch_encoder is not None:
             # Extract batch indices (assume they are integers or convert from one-hot)
@@ -466,11 +488,40 @@ class StateTransitionPerturbationModel(PerturbationModel):
 
         confidence_pred = None
         if self.confidence_token is not None:
-            # Append confidence token: [B, S, E] -> [B, S+1, E] (might be one more if we have the batch token)
+            # Append confidence token: [B, S, E] -> [B, S+1, E]
             seq_input = self.confidence_token.append_confidence_token(seq_input)
 
+        # Positional encoding
+        seq_input = self.pos_enc(seq_input)
+
+        # Key padding mask support (True where padded)
+        key_padding_mask = None
+        if "seq_mask" in batch:
+            mask = batch["seq_mask"]
+            if padded:
+                mask = mask.reshape(-1, self.cell_sentence_len)
+            else:
+                mask = mask.reshape(1, -1)
+            # If we added special tokens, extend mask with False for them
+            extra_tokens = 0
+            if self.use_batch_token and self.batch_token is not None:
+                extra_tokens += 1
+            if self.confidence_token is not None:
+                extra_tokens += 1
+            if extra_tokens > 0:
+                B = mask.size(0)
+                extra = torch.zeros(B, extra_tokens, dtype=mask.dtype, device=mask.device)
+                # batch token is prepended, confidence token appended
+                if self.use_batch_token and self.batch_token is not None and self.confidence_token is not None:
+                    mask = torch.cat([extra[:, :1], mask, extra[:, 1:2]], dim=1)
+                elif self.use_batch_token and self.batch_token is not None:
+                    mask = torch.cat([extra[:, :1], mask], dim=1)
+                elif self.confidence_token is not None:
+                    mask = torch.cat([mask, extra[:, :1]], dim=1)
+            key_padding_mask = mask
+
         # Self-attention encoder
-        transformer_output = self.transformer_encoder(seq_input)
+        transformer_output = self.transformer_encoder(seq_input, mask=None, src_key_padding_mask=key_padding_mask)
         transformer_output = self.encoder_norm(transformer_output)
 
         # Manage special tokens
@@ -503,24 +554,34 @@ class StateTransitionPerturbationModel(PerturbationModel):
         is_gene_space = self.hparams["embed_key"] == "X_hvg" or self.hparams["embed_key"] is None
         # logger.info(f"DEBUG: is_gene_space: {is_gene_space}")
         # logger.info(f"DEBUG: self.gene_decoder: {self.gene_decoder}")
-        if is_gene_space or self.gene_decoder is None:
+        if self._is_gene_space() or self.gene_decoder is None:
             out_pred = self.relu(out_pred)
 
         output = out_pred.reshape(-1, self.output_dim)
 
+        if return_hidden:
+            hidden_tokens = main_output  # [B, S, H]
+            if confidence_pred is not None:
+                return output, confidence_pred, hidden_tokens
+            return output, hidden_tokens
         if confidence_pred is not None:
             return output, confidence_pred
-        else:
-            return output
+        return output
 
     def training_step(self, batch: Dict[str, torch.Tensor], batch_idx: int, padded=True) -> torch.Tensor:
         """Training step logic for both main model and decoder."""
-        # Get model predictions (in latent space)
+        # Get model predictions (in latent space), optionally with hidden states
         confidence_pred = None
-        if self.confidence_token is not None:
-            pred, confidence_pred = self.forward(batch, padded=padded)
+        if self.gene_decoder_uses_hidden:
+            if self.confidence_token is not None:
+                pred, confidence_pred, hidden_tokens = self.forward(batch, padded=padded, return_hidden=True)
+            else:
+                pred, hidden_tokens = self.forward(batch, padded=padded, return_hidden=True)
         else:
-            pred = self.forward(batch, padded=padded)
+            if self.confidence_token is not None:
+                pred, confidence_pred = self.forward(batch, padded=padded)
+            else:
+                pred = self.forward(batch, padded=padded)
 
         target = batch["pert_cell_emb"]
 
@@ -610,25 +671,38 @@ class StateTransitionPerturbationModel(PerturbationModel):
 
             # If using cross-attention decoder, feed hidden states instead of output_dim
             if getattr(self, "gene_decoder_uses_hidden", False):
-                # Recompute hidden states with current batch using self-attention encoder
-                S = self.cell_sentence_len if padded else batch["pert_emb"].shape[0]
-                pert = batch["pert_emb"].reshape(-1, S, self.pert_dim if padded else batch["pert_emb"].shape[-1])
-                basal = batch["ctrl_cell_emb"].reshape(-1, S, self.input_dim if padded else batch["ctrl_cell_emb"].shape[-1])
-                pert_embedding = self.encode_perturbation(pert)
-                control_cells = self.encode_basal_expression(basal)
-                seq_input_hidden = pert_embedding + control_cells
-                if self.use_batch_token and self.batch_token is not None:
-                    B = seq_input_hidden.size(0)
-                    seq_input_hidden = torch.cat([self.batch_token.expand(B, -1, -1), seq_input_hidden], dim=1)
-                if self.confidence_token is not None:
-                    seq_input_hidden = self.confidence_token.append_confidence_token(seq_input_hidden)
-                hidden_out = self.transformer_encoder(seq_input_hidden)
-                hidden_out = self.encoder_norm(hidden_out)
-                if self.confidence_token is not None:
-                    hidden_out, _ = self.confidence_token.extract_confidence_prediction(hidden_out)
-                if self.use_batch_token and self.batch_token is not None:
-                    hidden_out = hidden_out[:, 1:, :]
-                latent_preds = hidden_out
+                # If we asked for hidden states above, hidden_tokens will be defined
+                if 'hidden_tokens' in locals():  # type: ignore[has-type]
+                    latent_preds = hidden_tokens  # type: ignore[has-type]
+                else:
+                    # Fallback: recompute from current batch
+                    S = self.cell_sentence_len if padded else batch["pert_emb"].shape[0]
+                    pert = batch["pert_emb"].reshape(
+                        -1, S, self.pert_dim if padded else batch["pert_emb"].shape[-1]
+                    )
+                    basal = batch["ctrl_cell_emb"].reshape(
+                        -1, S, self.input_dim if padded else batch["ctrl_cell_emb"].shape[-1]
+                    )
+                    pert_embedding = self.encode_perturbation(pert)
+                    control_cells = self.encode_basal_expression(basal)
+                    gamma = self.film_gamma(pert_embedding)
+                    beta = self.film_beta(pert_embedding)
+                    seq_input_hidden = gamma * control_cells + beta
+                    if self.use_batch_token and self.batch_token is not None:
+                        B = seq_input_hidden.size(0)
+                        seq_input_hidden = torch.cat(
+                            [self.batch_token.expand(B, -1, -1), seq_input_hidden], dim=1
+                        )
+                    if self.confidence_token is not None:
+                        seq_input_hidden = self.confidence_token.append_confidence_token(seq_input_hidden)
+                    seq_input_hidden = self.pos_enc(seq_input_hidden)
+                    hidden_out = self.transformer_encoder(seq_input_hidden)
+                    hidden_out = self.encoder_norm(hidden_out)
+                    if self.confidence_token is not None:
+                        hidden_out, _ = self.confidence_token.extract_confidence_prediction(hidden_out)
+                    if self.use_batch_token and self.batch_token is not None:
+                        hidden_out = hidden_out[:, 1:, :]
+                    latent_preds = hidden_out
 
             if isinstance(self.gene_decoder, NBDecoder):
                 mu, theta = self.gene_decoder(latent_preds)
@@ -677,9 +751,6 @@ class StateTransitionPerturbationModel(PerturbationModel):
             # Add to total loss with weighting
             confidence_weight = 0.1  # You can make this configurable
             total_loss = total_loss + confidence_weight * confidence_loss
-
-            # Add to total loss
-            total_loss = total_loss + confidence_loss
 
         if self.regularization > 0.0:
             ctrl_cell_emb = batch["ctrl_cell_emb"].reshape_as(pred)
