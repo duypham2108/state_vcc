@@ -871,11 +871,20 @@ class StateTransitionPerturbationModel(PerturbationModel):
         Typically used for final inference. We'll replicate old logic:s
          returning 'preds', 'X', 'pert_name', etc.
         """
-        if self.confidence_token is None:
-            latent_output = self.forward(batch, padded=padded)  # shape [B, ...]
-            confidence_pred = None
+        if getattr(self, "gene_decoder_uses_hidden", False):
+            if self.confidence_token is None:
+                latent_output, hidden_tokens = self.forward(batch, padded=padded, return_hidden=True)
+                confidence_pred = None
+            else:
+                latent_output, confidence_pred, hidden_tokens = self.forward(
+                    batch, padded=padded, return_hidden=True
+                )
         else:
-            latent_output, confidence_pred = self.forward(batch, padded=padded)
+            if self.confidence_token is None:
+                latent_output = self.forward(batch, padded=padded)  # shape [B, ...]
+                confidence_pred = None
+            else:
+                latent_output, confidence_pred = self.forward(batch, padded=padded)
 
         output_dict = {
             "preds": latent_output,
@@ -894,11 +903,20 @@ class StateTransitionPerturbationModel(PerturbationModel):
             output_dict["confidence_pred"] = confidence_pred
 
         if self.gene_decoder is not None:
+            if getattr(self, "gene_decoder_uses_hidden", False):
+                decoder_in = hidden_tokens
+            else:
+                decoder_in = latent_output
+
             if isinstance(self.gene_decoder, NBDecoder):
-                mu, _ = self.gene_decoder(latent_output)
+                mu, _ = self.gene_decoder(decoder_in)
                 pert_cell_counts_preds = mu
             else:
-                pert_cell_counts_preds = self.gene_decoder(latent_output)
+                pert_cell_counts_preds = self.gene_decoder(decoder_in)
+
+            # Ensure [S, G] for downstream writing when B=1
+            if pert_cell_counts_preds.dim() == 3 and pert_cell_counts_preds.size(0) == 1:
+                pert_cell_counts_preds = pert_cell_counts_preds.squeeze(0)
 
             output_dict["pert_cell_counts_preds"] = pert_cell_counts_preds
 
