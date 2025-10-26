@@ -202,6 +202,8 @@ class StateTransitionPerturbationModel(PerturbationModel):
                 freeze_embeddings=gene_ca_cfg.get("freeze_embeddings", True),
             )
             self.gene_decoder_uses_hidden = True
+            # Signal to checkpoint loader not to override externally configured decoder
+            self._decoder_externally_configured = True
 
         # Optional: CatBoost decoder (non-differentiable, inference-oriented)
         catboost_cfg = kwargs.get("catboost_decoder", None)
@@ -213,6 +215,7 @@ class StateTransitionPerturbationModel(PerturbationModel):
             target_dim = int(catboost_cfg.get("target_dim", effective_gene_dim))
             self.gene_decoder = CatBoostDecoder(model_path=model_path, target_dim=target_dim)
             self.gene_decoder_uses_hidden = False
+            self._decoder_externally_configured = True
 
         # Add an optional encoder that introduces a batch variable
         self.batch_encoder = None
@@ -298,6 +301,7 @@ class StateTransitionPerturbationModel(PerturbationModel):
                 hidden_dims=[512, 512, 512],
                 dropout=self.dropout,
             )
+            self._decoder_externally_configured = True
 
         control_pert = kwargs.get("control_pert", "non-targeting")
         if kwargs.get("finetune_vci_decoder", False):  # TODO: This will go very soon
@@ -328,6 +332,7 @@ class StateTransitionPerturbationModel(PerturbationModel):
                 genes=gene_names,
                 # latent_dim=self.output_dim + (self.batch_dim or 0),
             )
+            self._decoder_externally_configured = True
         
         # FiLM fusion layers for conditioning control cells by perturbation
         self.film_gamma = nn.Linear(self.hidden_dim, self.hidden_dim)
@@ -898,3 +903,38 @@ class StateTransitionPerturbationModel(PerturbationModel):
             output_dict["pert_cell_counts_preds"] = pert_cell_counts_preds
 
         return output_dict
+
+    # Ensure decoder architecture from checkpoint is respected and not overwritten
+    def on_load_checkpoint(self, checkpoint: dict) -> None:  # type: ignore[override]
+        # Detect cross-attention decoder in checkpoint state by presence of its keys
+        state = checkpoint.get("state_dict", {})
+        has_cross_attn_keys = any(
+            k.startswith("gene_decoder.gene_key.") or k == "gene_decoder._gene_embeddings" for k in state.keys()
+        )
+
+        if has_cross_attn_keys and not isinstance(getattr(self, "gene_decoder", None), GeneCrossAttentionDecoder):
+            # Rebuild a matching GeneCrossAttentionDecoder before base tries to override it
+            genes_list = list(self.gene_names) if self.gene_names is not None else []
+            emb_tensor = state.get("gene_decoder._gene_embeddings", None)
+            gene_embeds_dict = None
+            if emb_tensor is not None and len(genes_list) == int(emb_tensor.shape[0]):
+                gene_embeds_dict = {g: emb_tensor[i].detach().cpu() for i, g in enumerate(genes_list)}
+
+            self.gene_decoder = GeneCrossAttentionDecoder(
+                hidden_dim=self.hidden_dim,
+                genes=genes_list,
+                gene_embeddings=gene_embeds_dict,
+                gene_embeddings_path=None,
+                num_heads=4,
+                dropout=self.dropout,
+                freeze_embeddings=True,
+            )
+            self.gene_decoder_uses_hidden = True
+            self._decoder_externally_configured = True
+
+        # Defer to base logic (which will skip overriding if externally configured)
+        try:
+            super().on_load_checkpoint(checkpoint)  # type: ignore[misc]
+        except Exception:
+            # Some older checkpoints may not be compatible with base hook; ignore
+            pass
